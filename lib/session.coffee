@@ -796,6 +796,7 @@ rpcRequest = (sessionContext, _declarations, callback) ->
 # Simple algorithm to estimate GPN count in a set of patterns used
 # to decide whether to use nextLevel = false in GPN.
 estimateGpnCount = (patterns) ->
+  return true
   res = []
   counts = new Map()
   for pattern in patterns
