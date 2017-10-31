@@ -32,7 +32,7 @@ localCache = require './local-cache'
 db = require './db'
 logger = require './logger'
 
-MAX_CYCLES = 4
+MAX_CYCLES = 6
 
 
 throwError = (err, httpResponse) ->
