@@ -613,8 +613,9 @@ rpcRequest = (sessionContext, _declarations, callback) ->
       return callback(err) if err
       return rpcRequest(sessionContext, null, callback)
     )
-###
-This seems to not work on full data pulls.
+
+  ###
+  This seems to not work on full data pulls.
   if sessionContext.rpcCount >= 255 or
       sessionContext.revisions.length >= 8 or
       sessionContext.cycle >= 16 or
@@ -626,8 +627,7 @@ This seems to not work on full data pulls.
       timestamp: sessionContext.timestamp
     }
     return callback(null, fault)
-###
-
+  ###
   if (sessionContext.syncState?.virtualParameterDeclarations?.length or 0) < sessionContext.declarations.length
     inception = sessionContext.syncState?.virtualParameterDeclarations?.length or 0
     # Avoid unnecessary increment of iteration when using vparams
