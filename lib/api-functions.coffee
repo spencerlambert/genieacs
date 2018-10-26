@@ -154,6 +154,12 @@ connectionRequest = (deviceId, callback) ->
       username = device.InternetGatewayDevice.ManagementServer.ConnectionRequestUsername?._value
       password = device.InternetGatewayDevice.ManagementServer.ConnectionRequestPassword?._value
 
+    # Make sure username and password aren't undifined, as that state crashes httpConReq()
+    if not username?
+      username = "";
+    if not password?
+      password = "";
+
     conReq = () ->
       udpSent = udpConReq(udpConnectionRequestAddress, username, password, (err) -> throw err if err)
 
