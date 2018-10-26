@@ -28,7 +28,7 @@ VersionedMap = require './versioned-map'
 InstanceSet = require './instance-set'
 defaultProvisions = require './default-provisions'
 
-MAX_ITERATIONS = 64
+MAX_ITERATIONS = 256
 
 provisionsCache = new WeakMap()
 virtualParametersCache = new WeakMap()
