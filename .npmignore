@@ -17,5 +17,4 @@ config/ext
 debug/*
 !debug/.gitkeep
 
-lib/*.coffee
-lib/*.map
+.eslintrc.json
