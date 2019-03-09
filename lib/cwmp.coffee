@@ -31,7 +31,7 @@ cache = require './cache'
 db = require './db'
 logger = require './logger'
 
-MAX_CYCLES = 4
+MAX_CYCLES = 100
 
 
 throwError = (err, httpResponse) ->
