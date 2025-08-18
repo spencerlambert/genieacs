@@ -421,6 +421,9 @@ nextRpc = (sessionContext) ->
         when 'download'
           session.addProvisions(sessionContext, "task_#{task._id}",
             [['download', task.fileType, task.fileName, task.targetFileName]])
+        when 'upload'
+          session.addProvisions(sessionContext, "task_#{task._id}",
+            [['upload', task.fileType, task.fileName, task.targetFileName]])
         when 'addObject'
           alias = ("#{p[0]}:#{JSON.stringify(p[1])}" for p in task.parameterValues or []).join(',')
           session.addProvisions(sessionContext, "task_#{task._id}",
@@ -490,6 +493,16 @@ sendAcsRequest = (sessionContext, id, acsRequest) ->
       acsRequest.url = if FS_SSL then 'https://' else 'http://'
       acsRequest.url += FS_HOSTNAME
       acsRequest.url += ":#{FS_PORT}" if FS_PORT != 80
+      acsRequest.url += "/#{encodeURIComponent(acsRequest.fileName)}"
+
+  if acsRequest.name is 'Upload'
+    if not acsRequest.url?
+      UP_FS_PORT = config.get('UP_FS_PORT')
+      UP_FS_HOSTNAME = config.get('UP_FS_HOSTNAME')
+      UP_FS_SSL = config.get('UP_FS_SSL')
+      acsRequest.url = if UP_FS_SSL then 'https://' else 'http://'
+      acsRequest.url += UP_FS_HOSTNAME
+      acsRequest.url += ":#{UP_FS_PORT}" if UP_FS_PORT != 80
       acsRequest.url += "/#{encodeURIComponent(acsRequest.fileName)}"
 
     if not acsRequest.fileSize?

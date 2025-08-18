@@ -1022,6 +1022,22 @@ generateSetRpcRequest = (sessionContext) ->
         targetFileName: deviceData.attributes.get(targetFileNamePath)?.value?[1][0]
       }
 
+  # Upload
+  iter = syncState.uploadsUpload.entries()
+  while pair = iter.next().value
+    if not (pair[1] <= deviceData.attributes.get(pair[0])?.value?[1][0])
+      fileTypePath = deviceData.paths.get(pair[0].slice(0, -1).concat('FileType'))
+      fileNamePath = deviceData.paths.get(pair[0].slice(0, -1).concat('FileName'))
+      targetFileNamePath = deviceData.paths.get(pair[0].slice(0, -1).concat('TargetFileName'))
+      return {
+        name: 'Upload'
+        commandKey: generateRpcId(sessionContext)
+        instance: pair[0][1]
+        fileType: deviceData.attributes.get(fileTypePath)?.value?[1][0]
+        fileName: deviceData.attributes.get(fileNamePath)?.value?[1][0]
+        targetFileName: deviceData.attributes.get(targetFileNamePath)?.value?[1][0]
+      }
+
   return null
 
 
@@ -1134,6 +1150,12 @@ processDeclarations = (sessionContext, allDeclareTimestamps, allDeclareAttribute
             syncState.downloadsDownload.set(currentPath, declareAttributeValues.value[0])
           else
             syncState.downloadsValues.set(currentPath, declareAttributeValues.value[0])
+      when 'Uploads'
+        if currentPath.length == 3 and currentPath.wildcard == 0 and declareAttributeValues.value?
+          if currentPath[2] == 'Upload'
+            syncState.uploadsUpload.set(currentPath, declareAttributeValues.value[0])
+          else
+            syncState.uploadsValues.set(currentPath, declareAttributeValues.value[0])
       when 'VirtualParameters'
         if currentPath.length <= 2
           d = null
@@ -1489,6 +1511,10 @@ rpcResponse = (sessionContext, id, rpcRes, callback) ->
         sessionContext.operations[rpcReq.commandKey] = operation
         sessionContext.operationsTouched ?= {}
         sessionContext.operationsTouched[rpcReq.commandKey] = 1
+
+    when 'UploadResponse'
+      toClear = device.set(sessionContext.deviceData, ['Uploads', rpcReq.instance, 'Upload'],
+        timestamp + 1, {value: [timestamp + 1, [timestamp + 1, 'xsd:dateTime']]}, toClear)
 
     else
       return callback(new Error('Response name not recognized'))
