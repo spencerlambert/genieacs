@@ -3,6 +3,7 @@ import { get } from "../config.ts";
 import * as MongoTypes from "./types.ts";
 
 export let filesBucket: GridFSBucket;
+export let uploadsBucket: GridFSBucket;
 
 export const collections = {
   devices: null as Collection<MongoTypes.Device>,
@@ -19,6 +20,7 @@ export const collections = {
   config: null as Collection<MongoTypes.Config>,
   cache: null as Collection<MongoTypes.Cache>,
   locks: null as Collection<MongoTypes.Lock>,
+  uploads: null as Collection<MongoTypes.Upload>,
 };
 
 let clientPromise: Promise<MongoClient>;
@@ -43,7 +45,9 @@ export async function connect(): Promise<void> {
   collections.config = db.collection("config");
   collections.cache = db.collection("cache");
   collections.locks = db.collection("locks");
+  collections.uploads = db.collection("uploads.files");
   filesBucket = new GridFSBucket(db);
+  uploadsBucket = new GridFSBucket(db, { bucketName: "uploads" });
 
   await Promise.all([
     collections.tasks.createIndex({ device: 1, timestamp: 1 }),

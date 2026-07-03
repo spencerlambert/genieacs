@@ -58,6 +58,12 @@ interface TaskDownload extends TaskBase {
   targetFileName?: string;
 }
 
+interface TaskUpload extends TaskBase {
+  name: "upload";
+  fileType: string;
+  fileName: string;
+}
+
 interface TaskAddObject extends TaskBase {
   name: "addObject";
   objectName: string;
@@ -81,6 +87,7 @@ export type Task =
   | TaskReboot
   | TaskFactoryReset
   | TaskDownload
+  | TaskUpload
   | TaskAddObject
   | TaskDeleteObject
   | TaskProvisions;
@@ -180,4 +187,12 @@ export interface Lock {
   value: string;
   timestamp: Date;
   expire: Date;
+}
+
+export interface Upload {
+  _id: string;
+  chunkSize: number;
+  filename: string;
+  length: number;
+  uploadDate: Date;
 }

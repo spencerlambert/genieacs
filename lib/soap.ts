@@ -26,6 +26,8 @@ import {
   type RebootResponse,
   type FactoryResetResponse,
   type DownloadResponse,
+  type Upload,
+  type UploadResponse,
   GetRPCMethodsRequest,
   RequestDownloadRequest,
   AcsResponse,
@@ -506,6 +508,22 @@ function Download(methodRequest): string {
   )}</FailureURL></cwmp:Download>`;
 }
 
+function Upload(methodRequest: Upload): string {
+  return `<cwmp:Upload><CommandKey>${
+    methodRequest.commandKey || ""
+  }</CommandKey><FileType>${encodeEntities(
+    methodRequest.fileType || "",
+  )}</FileType><URL>${encodeEntities(
+    methodRequest.url || "",
+  )}</URL><Username>${encodeEntities(
+    methodRequest.username || "",
+  )}</Username><Password>${encodeEntities(
+    methodRequest.password || "",
+  )}</Password><DelaySeconds>${
+    methodRequest.delaySeconds || "0"
+  }</DelaySeconds></cwmp:Upload>`;
+}
+
 function DownloadResponse(xml: Element): DownloadResponse {
   let status: number, startTime: number, completeTime: number;
   for (const c of xml.children) {
@@ -548,6 +566,59 @@ function DownloadResponse(xml: Element): DownloadResponse {
 
   return {
     name: "DownloadResponse",
+    status: status,
+    startTime: startTime,
+    completeTime: completeTime,
+  };
+}
+
+function UploadResponse(xml: Element): UploadResponse {
+  let statusEl: Element | undefined;
+  let startTimeEl: Element | undefined;
+  let completeTimeEl: Element | undefined;
+  for (const c of xml.children) {
+    switch (c.localName) {
+      case "Status":
+        statusEl = c;
+        break;
+      case "StartTime":
+        startTimeEl = c;
+        break;
+      case "CompleteTime":
+        completeTimeEl = c;
+        break;
+    }
+  }
+
+  let status = statusEl ? parseInt(statusEl.text) : NaN;
+  let startTime = startTimeEl ? Date.parse(startTimeEl.text) : NaN;
+  let completeTime = completeTimeEl ? Date.parse(completeTimeEl.text) : NaN;
+
+  if (!(status >= 0)) {
+    warnings.push({
+      message: "Missing or invalid XML node",
+      element: "Status",
+    });
+    status = 0;
+  }
+  if (isNaN(startTime)) {
+    warnings.push({
+      message: "Missing or invalid XML node",
+      element: "StartTime",
+    });
+    startTime = Date.parse("0001-01-01T00:00:00Z");
+  }
+
+  if (isNaN(completeTime)) {
+    warnings.push({
+      message: "Missing or invalid XML node",
+      element: "CompleteTime",
+    });
+    completeTime = Date.parse("0001-01-01T00:00:00Z");
+  }
+
+  return {
+    name: "UploadResponse",
     status: status,
     startTime: startTime,
     completeTime: completeTime,
@@ -949,6 +1020,9 @@ export function request(
     case "DownloadResponse":
       rpc.cpeResponse = DownloadResponse(methodElement);
       break;
+    case "UploadResponse":
+      rpc.cpeResponse = UploadResponse(methodElement);
+      break;
     case "Fault":
       rpc.cpeFault = fault(methodElement);
       break;
@@ -1045,6 +1119,9 @@ export function response(rpc: {
         break;
       case "Download":
         body = Download(rpc.acsRequest);
+        break;
+      case "Upload":
+        body = Upload(rpc.acsRequest);
         break;
       default:
         throw new Error(

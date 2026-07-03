@@ -16,6 +16,8 @@ import {
   putProvision,
   putUser,
   putVirtualParameter,
+  deleteUpload,
+  deleteDeviceUploads,
 } from "./ui/db.ts";
 import * as common from "./util.ts";
 import * as cache from "./cache.ts";
@@ -346,6 +348,14 @@ function sanitizeTask(task): void {
     case "factoryReset":
       break;
 
+    case "upload":
+      if (typeof task.fileType !== "string" || !task.fileType.length)
+        throw new Error("Missing 'fileType' property");
+
+      if (typeof task.fileName !== "string" || !task.fileName.length)
+        throw new Error("Missing 'fileName' property");
+      break;
+
     default:
       throw new Error("Invalid task name");
   }
@@ -388,6 +398,7 @@ export async function deleteDevice(deviceId: string): Promise<void> {
           $regex: `^${common.escapeRegExp(deviceId)}\\:`,
         },
       }),
+      deleteDeviceUploads(deviceId),
     ]);
   } finally {
     await releaseLock(`cwmp_session_${deviceId}`, token);
@@ -418,6 +429,8 @@ export async function deleteResource(
   } else if (resource === "files") {
     await deleteFile(id);
     await cache.del("cwmp-local-cache-hash");
+  } else if (resource === "uploads") {
+    await deleteUpload(id);
   } else if (resource === "faults") {
     await deleteFault(id);
   } else if (resource === "provisions") {
