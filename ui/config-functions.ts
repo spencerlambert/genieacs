@@ -9,7 +9,7 @@ interface Diff {
 }
 
 export function flattenConfig(config: Record<string, unknown>): any {
-  const flatten = {};
+  const flatten: Record<string, unknown> = {};
   const recuresive = (obj: any, root: string): void => {
     for (const [k, v] of Object.entries(obj)) {
       const key = root ? `${root}.${k}` : k;
@@ -54,32 +54,33 @@ function orderKeys(config: any): number {
 
 export function structureConfig(config: Config[]): any {
   config.sort((a, b) => (a._id > b._id ? 1 : a._id < b._id ? -1 : 0));
-  const _config = {};
+  const _config: Record<string, any> = {};
   for (const c of config) {
     const keys = c._id.split(".");
     let ref = _config;
     while (keys.length > 1) {
-      const k = keys.shift();
+      const k = keys.shift()!;
       if (ref[k] == null || typeof ref[k] !== "object") ref[k] = {};
       ref = ref[k];
     }
     ref[keys[0]] = c.value;
   }
 
-  const toArray = function (object): any {
+  const toArray = function (object: unknown): unknown {
     const MAX_BITS = 30;
     const MAX_ARRAY_SIZE = MAX_BITS * 10;
 
     if (object == null || typeof object !== "object") return object;
+    let obj = object as Record<string, unknown>;
 
-    if (Object.keys(object).length <= MAX_ARRAY_SIZE) {
+    if (Object.keys(obj).length <= MAX_ARRAY_SIZE) {
       let indexes = [];
-      for (const key of Object.keys(object)) {
+      for (const key of Object.keys(obj)) {
         const idx = Math.floor(+key);
         if (idx >= 0 && idx < MAX_ARRAY_SIZE && String(idx) === key) {
           const pos = Math.floor(idx / MAX_BITS);
           if (!indexes[pos]) indexes[pos] = 0;
-          indexes[pos] |= 1 << idx % MAX_BITS;
+          indexes[pos] |= 1 << (idx % MAX_BITS);
         } else {
           indexes = [];
           break;
@@ -87,20 +88,19 @@ export function structureConfig(config: Config[]): any {
       }
 
       let index = 0;
-      while (indexes.length && (index = indexes.shift()) === 1073741823);
+      while (indexes.length && (index = indexes.shift()!) === 1073741823);
 
       if (index && (~index & (index + 1)) === index + 1) {
         // its an array
         const array = [];
-        for (let i = 0; i < Object.keys(object).length; i++)
-          array[i] = object[i];
+        for (let i = 0; i < Object.keys(obj).length; i++) array[i] = obj[i];
 
-        object = array;
+        obj = array as unknown as Record<string, unknown>;
       }
     }
 
-    for (const [k, v] of Object.entries(object)) object[k] = toArray(v);
-    return object;
+    for (const [k, v] of Object.entries(obj)) obj[k] = toArray(v);
+    return obj;
   };
 
   const res = toArray(_config);
@@ -112,13 +112,13 @@ export function diffConfig(
   current: Record<string, unknown>,
   target: Record<string, unknown>,
 ): Diff {
-  const diff = {
+  const diff: Diff = {
     add: [],
     remove: [],
   };
 
   for (const [k, v] of Object.entries(target))
-    if (v && current[k] !== v) diff.add.push({ _id: k, value: v });
+    if (v && current[k] !== v) diff.add.push({ _id: k, value: v as string });
 
   for (const k of Object.keys(current)) if (!target[k]) diff.remove.push(k);
 

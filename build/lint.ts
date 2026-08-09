@@ -1,11 +1,11 @@
-import { exec } from "node:child_process";
+import { exec, ExecException } from "node:child_process";
 import { promisify } from "node:util";
 
 const execPromise = promisify(exec);
 
 async function runEslint(): Promise<string> {
   const CMD =
-    "eslint 'bin/*.ts' 'lib/**/*.ts' 'ui/**/*.ts' 'test/**/*.ts' 'build/**/*.ts'";
+    "eslint 'bin/*.ts' 'lib/**/*.ts' 'ui/**/*.ts' 'test/**/*.ts' 'build/**/*.ts' 'seed/*'";
   const env = {
     ...(process.stdout.isTTY && { FORCE_COLOR: "1" }),
     ...process.env,
@@ -15,20 +15,31 @@ async function runEslint(): Promise<string> {
     if (stderr) throw new Error(stderr);
     return stdout;
   } catch (err) {
-    if (err.killed || err.signal || err.stderr || err.code !== 1) throw err;
-    return err.stdout;
+    if (!(err instanceof Error)) throw err;
+    const e = err as ExecException;
+    if (e.killed || e.signal || e.stderr || e.code !== 1) throw err;
+    process.exitCode = 1;
+    return e.stdout ?? "";
   }
 }
 
 async function runTsc(): Promise<string> {
-  const CMD = "tsc --noEmit";
+  const CMD = "tsgo --noEmit && tsgo -p seed/tsconfig.json";
   const env = {
     ...(process.stdout.isTTY && { FORCE_COLOR: "1" }),
     ...process.env,
   };
-  const { stdout, stderr } = await execPromise(CMD, { env });
-  if (stderr) throw new Error(stderr);
-  return stdout;
+  try {
+    const { stdout, stderr } = await execPromise(CMD, { env });
+    if (stderr) throw new Error(stderr);
+    return stdout;
+  } catch (err) {
+    if (!(err instanceof Error)) throw err;
+    const e = err as ExecException;
+    if (e.killed || e.signal || e.stderr || !e.stdout) throw err;
+    process.exitCode = 1;
+    return e.stdout;
+  }
 }
 
 async function runPrettier(): Promise<string> {
@@ -52,4 +63,7 @@ async function runAll(): Promise<void> {
   console.log(await prom3);
 }
 
-runAll().catch(console.error);
+runAll().catch((err: unknown) => {
+  process.exitCode = 1;
+  console.error(err);
+});

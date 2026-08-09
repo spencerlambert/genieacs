@@ -1,18 +1,20 @@
+import { div, disposeElement } from "./dom.ts";
+
 type AutocompleteCallback = (
   value: string,
   callback: (suggestions: { value: string; tip?: string }[]) => void,
 ) => void;
 
 export default class Autocomplete {
-  private declare callback: AutocompleteCallback;
-  private declare element: HTMLInputElement;
-  private declare hideTimeout: NodeJS.Timeout;
-  private declare visible: boolean;
-  private declare default: string;
-  private declare selection: number;
-  private declare container: HTMLElement;
+  declare private callback: AutocompleteCallback;
+  declare private element: HTMLInputElement | null;
+  declare private hideTimeout: NodeJS.Timeout | null;
+  declare private visible: boolean;
+  declare private default: string | null;
+  declare private selection: number | null;
+  declare private container: HTMLElement;
 
-  public constructor(className: string, callback: AutocompleteCallback) {
+  public constructor(callback: AutocompleteCallback) {
     this.callback = callback;
     this.element = null;
     this.hideTimeout = null;
@@ -20,15 +22,14 @@ export default class Autocomplete {
     this.default = null;
     this.selection = null;
 
-    this.container = document.createElement("div");
-    this.container.style.position = "absolute";
-    this.container.style.display = "block";
-    this.container.style.opacity = "0";
-    this.container.className = className;
+    this.container = div({
+      class: "absolute py-1 mt-2 rounded-md shadow-lg bg-white",
+      style: "position:absolute;display:block;opacity:0",
+    });
   }
 
   public attach(el: HTMLInputElement): void {
-    el.setAttribute("autocomplete", "off");
+    el.autocomplete = "off";
 
     el.addEventListener("focus", () => {
       this.element = el;
@@ -60,7 +61,8 @@ export default class Autocomplete {
         this.update();
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
-        --this.selection;
+        if (this.selection == null) this.selection = -1;
+        else --this.selection;
         this.update();
       }
     });
@@ -90,17 +92,24 @@ export default class Autocomplete {
     this.visible = false;
     this.default = null;
     this.selection = null;
-    clearTimeout(this.hideTimeout);
+    if (this.hideTimeout) clearTimeout(this.hideTimeout);
     this.hideTimeout = setTimeout(() => {
       this.hideTimeout = null;
-      while (this.container.firstChild)
-        this.container.removeChild(this.container.firstChild);
-      document.body.removeChild(this.container);
+      this.clearContainer();
+      this.container.remove();
     }, 500);
+  }
+
+  private clearContainer(): void {
+    for (const child of Array.from(this.container.childNodes)) {
+      disposeElement(child);
+      child.parentNode?.removeChild(child);
+    }
   }
 
   private update(): void {
     const el = this.element;
+    if (!el) return;
 
     this.callback(el.value, (suggestions) => {
       if (this.element !== el) return;
@@ -112,15 +121,16 @@ export default class Autocomplete {
         return;
       }
 
-      while (this.container.firstChild)
-        this.container.removeChild(this.container.firstChild);
+      this.clearContainer();
 
       if (!this.visible) {
         if (!this.hideTimeout) {
-          document.body.appendChild(this.container);
-          window.getComputedStyle(this.container).opacity;
+          document.body.append(this.container);
+          // Force style recalc so the initial opacity is resolved before
+          // setting it to "1", allowing the CSS transition to play.
+          void window.getComputedStyle(this.container).opacity;
         } else {
-          clearTimeout(this.hideTimeout);
+          if (this.hideTimeout) clearTimeout(this.hideTimeout);
           this.hideTimeout = null;
         }
         this.container.style.opacity = "1";
@@ -136,25 +146,26 @@ export default class Autocomplete {
         this.default = suggestions[0].value;
       }
 
-      let selectedElement;
+      let selectedElement: HTMLElement | undefined;
       for (const [idx, suggestion] of suggestions.entries()) {
-        const e = document.createElement("div");
-        if (suggestion.tip) e.title = suggestion.tip;
-        e.classList.add("suggestion");
-        if (idx === this.selection) {
-          e.classList.add("selected");
-          selectedElement = e;
-        }
+        const item = div(
+          {
+            class:
+              "text-stone-700 block px-4 py-2 text-sm hover:bg-stone-100 hover:text-stone-900" +
+              (idx === this.selection ? " bg-stone-100 text-stone-900" : ""),
+            title: suggestion.tip || undefined,
+            onmousedown: (ev) => {
+              ev.preventDefault();
+              el.value = suggestion.value;
+              el.dispatchEvent(new InputEvent("input"));
+              if (this.element === el) this.update();
+            },
+          },
+          suggestion.value,
+        );
 
-        const t = document.createTextNode(suggestion.value);
-        e.appendChild(t);
-        e.addEventListener("mousedown", (ev) => {
-          ev.preventDefault();
-          el.value = suggestion.value;
-          el.dispatchEvent(new InputEvent("input"));
-          if (this.element === el) this.update();
-        });
-        this.container.appendChild(e);
+        if (idx === this.selection) selectedElement = item;
+        this.container.append(item);
       }
 
       // Ensure selected element is in view

@@ -1,5 +1,6 @@
 import { ObjectId } from "mongodb";
-import { Expression, FaultStruct } from "../types.ts";
+import { FaultStruct } from "../types.ts";
+import { Value } from "../common/expression.ts";
 
 export interface Fault {
   _id: string;
@@ -26,6 +27,11 @@ interface TaskBase {
   expiry?: Date;
   name: string;
   device: string;
+}
+
+export interface View {
+  _id: string;
+  script: string;
 }
 
 interface TaskGetParameterValues extends TaskBase {
@@ -58,6 +64,12 @@ interface TaskDownload extends TaskBase {
   targetFileName?: string;
 }
 
+interface TaskUpload extends TaskBase {
+  name: "upload";
+  fileType: string;
+  fileName: string;
+}
+
 interface TaskAddObject extends TaskBase {
   name: "addObject";
   objectName: string;
@@ -71,7 +83,7 @@ interface TaskDeleteObject extends TaskBase {
 
 interface TaskProvisions extends TaskBase {
   name: "provisions";
-  provisions?: [string, ...Expression[]][];
+  provisions?: [string, ...Value[]][];
 }
 
 export type Task =
@@ -81,6 +93,7 @@ export type Task =
   | TaskReboot
   | TaskFactoryReset
   | TaskDownload
+  | TaskUpload
   | TaskAddObject
   | TaskDeleteObject
   | TaskProvisions;
@@ -122,7 +135,7 @@ type Configuration =
   | { type: "delete_tag"; tag: string }
   | { type: "add_object"; name: string; object: string }
   | { type: "delete_object"; name: string; object: string }
-  | { type: "provision"; name: string; args?: Expression[] };
+  | { type: "provision"; name: string; args?: string[] };
 
 export interface Preset {
   _id: string;
@@ -130,10 +143,14 @@ export interface Preset {
   channel: string;
   events: Record<string, boolean>;
   configurations: Configuration[];
+  schedule?: string;
+  precondition?: string;
 }
 
 export interface Object {
   _id: string;
+  _keys?: string[];
+  [key: string]: unknown;
 }
 
 export interface Provision {
@@ -180,4 +197,12 @@ export interface Lock {
   value: string;
   timestamp: Date;
   expire: Date;
+}
+
+export interface Upload {
+  _id: string;
+  chunkSize: number;
+  filename: string;
+  length: number;
+  uploadDate: Date;
 }

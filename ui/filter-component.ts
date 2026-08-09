@@ -1,14 +1,14 @@
-import m, { ClosureComponent } from "mithril";
-import { parse, stringify, map } from "../lib/common/expression/parser.ts";
+import { div, label, input, each } from "./dom.ts";
+import { StateSignal } from "./signals.ts";
 import memoize from "../lib/common/memoize.ts";
-import Autocomplete from "./autocomplete-compnent.ts";
+import Autocomplete from "./autocomplete-component.ts";
 import * as smartQuery from "./smart-query.ts";
 import { validQuery } from "../lib/db/synth.ts";
-import { Expression } from "../lib/types.ts";
+import Expression from "../lib/common/expression.ts";
 
 const getAutocomplete = memoize((resource) => {
   const labels = smartQuery.getLabels(resource);
-  const autocomplete = new Autocomplete("autocomplete", (txt, cb) => {
+  const autocomplete = new Autocomplete((txt, cb) => {
     txt = txt.toLowerCase();
     cb(
       labels
@@ -22,20 +22,34 @@ const getAutocomplete = memoize((resource) => {
   return autocomplete;
 });
 
-function parseFilter(resource, f): Expression {
+function parseFilter(resource: smartQuery.Resource, f: string): Expression {
   let exp;
   if (/^[\s0-9a-zA-Z]+:/.test(f)) {
     const k = f.split(":", 1)[0];
     const v = f.slice(k.length + 1).trim();
-    exp = ["FUNC", "Q", k.trim(), v];
+    exp = new Expression.FunctionCall("Q", [
+      new Expression.Literal(k.trim()),
+      new Expression.Literal(v),
+    ]);
   } else {
-    exp = parse(f);
+    exp = Expression.parse(f);
   }
 
-  const unpacked = map(exp, (e) => {
-    if (Array.isArray(e) && e[0] === "FUNC") {
-      if (e[1] === "Q") return smartQuery.unpack(resource, e[2], e[3]);
-      else if (e[1] === "NOW") return Date.now();
+  const unpacked = exp.evaluate((e) => {
+    if (e instanceof Expression.FunctionCall) {
+      if (e.name === "NOW") return new Expression.Literal(Date.now());
+      else if (e.name === "Q") {
+        if (
+          e.args[0] instanceof Expression.Literal &&
+          e.args[1] instanceof Expression.Literal
+        ) {
+          return smartQuery.unpack(
+            resource,
+            e.args[0].value as string,
+            e.args[1].value as string,
+          );
+        }
+      }
     }
     return e;
   });
@@ -46,100 +60,110 @@ function parseFilter(resource, f): Expression {
   return exp;
 }
 
-function stringifyFilter(f: Expression): string {
-  if (Array.isArray(f) && f[0] === "FUNC" && f[1] === "Q")
-    return `${f[2]}: ${f[3]}`;
-  return stringify(f);
-}
-
-function splitFilter(filter: string): string[] {
+function splitFilter(filter: Expression | undefined): string[] {
   if (!filter) return [""];
-  const list: string[] = [];
-  const f = parse(filter);
-  if (Array.isArray(f) && f[0] === "AND")
-    for (const ff of f.slice(1)) list.push(stringifyFilter(ff));
-  else list.push(stringifyFilter(f));
+  if (filter instanceof Expression.Literal && filter.value) return [""];
+  const list: Expression[] = [filter];
+  const res: string[] = [];
+  while (list.length) {
+    const f = list.pop()!;
+    if (f instanceof Expression.Binary && f.operator === "AND") {
+      list.push(f.right);
+      list.push(f.left);
+    } else if (f instanceof Expression.FunctionCall && f.name === "Q") {
+      const l = f.args[0] as Expression.Literal;
+      const r = f.args[1] as Expression.Literal;
+      res.push(`${l.value}: ${r.value}`);
+    } else {
+      res.push(f.toString());
+    }
+  }
 
-  list.push("");
-  return list;
+  res.push("");
+  return res;
 }
 
 interface Attrs {
-  resource: string;
-  filter: string;
-  onChange: (filter: string) => void;
+  resource: smartQuery.Resource;
+  filter?: Expression;
+  onChange: (filter: Expression) => void;
 }
 
-const component: ClosureComponent<Attrs> = (initialVnode) => {
-  let filterList = splitFilter(initialVnode.attrs.filter);
-  let filterInvalid = 0;
+const BASE_INPUT_CLASS =
+  "appearance-none rounded-none relative block w-full px-3 py-2 border-stone-300 placeholder-stone-500 text-stone-900 focus:ring-cyan-500 focus:border-cyan-500 focus:z-10 sm:text-sm";
+
+export function createFilter(attrs: Attrs): HTMLElement {
+  const filterList = new StateSignal<string[]>(splitFilter(attrs.filter));
+  const filterInvalid = new StateSignal(0);
   let filterTouched = false;
-  let attrs: Attrs = initialVnode.attrs;
 
   function onChange(): void {
     filterTouched = false;
-    filterInvalid = 0;
-    filterList = filterList.filter((f) => f);
-    const list = filterList.map((f, idx) => {
+    const list = filterList.get().filter((f) => f);
+    let invalid = 0;
+    let filter: Expression = new Expression.Literal(true);
+    for (const [idx, f] of list.entries()) {
       try {
-        return parseFilter(attrs.resource, f);
-      } catch (err) {
-        filterInvalid |= 1 << idx;
+        filter = Expression.and(filter, parseFilter(attrs.resource, f));
+      } catch {
+        invalid |= 1 << idx;
       }
-      return null;
-    });
-    filterList.push("");
-
-    if (filterInvalid) {
-      m.redraw();
-      return;
     }
-    if (list.length === 0) attrs.onChange("");
-    else if (list.length > 1) attrs.onChange(stringify(["AND", ...list]));
-    else attrs.onChange(stringify(list[0]));
+    list.push("");
+    filterInvalid.set(invalid);
+    filterList.set(list);
+
+    if (invalid) return;
+    if (!list.length) attrs.onChange(new Expression.Literal(true));
+    else attrs.onChange(filter);
   }
 
-  return {
-    onupdate: (vnode) => {
-      getAutocomplete(vnode.attrs.resource).reposition();
-    },
-    view: (vnode) => {
-      if (attrs.filter !== vnode.attrs.filter) {
-        filterInvalid = 0;
-        filterList = splitFilter(vnode.attrs.filter);
-      }
-
-      attrs = vnode.attrs;
-
-      return m("div.filter", [
-        m("b", "Filter"),
-        ...filterList.map((fltr, idx) => {
-          return m("input", {
+  return div(
+    { class: "mb-5" },
+    label({ class: "text-sm font-semibold text-stone-700" }, "Filter"),
+    div(
+      { class: "shadow-sm rounded-md mt-1 max-w-screen-sm -space-y-px" },
+      each(
+        filterList,
+        (_, idx) => idx,
+        (_fltr, getIdx) => {
+          const inputEl = input({
             type: "text",
-            class: `${(filterInvalid >> idx) & 1 ? "error" : ""}`,
-            value: fltr,
+            class: () => {
+              const idx = getIdx();
+              const list = filterList.get();
+              let c = BASE_INPUT_CLASS;
+              if (idx === 0) c += " rounded-t-md";
+              if (idx === list.length - 1) c += " rounded-b-md";
+              if (filterInvalid.get() & (1 << idx)) c += " !text-red-700";
+              return c;
+            },
+            value: () => filterList.get()[getIdx()] ?? "",
             oninput: (e) => {
-              e.redraw = false;
-              filterList[idx] = e.target.value;
+              filterList.get()[getIdx()] = (e.target as HTMLInputElement).value;
               filterTouched = true;
             },
-            oncreate: (vn) => {
-              const el = vn.dom as HTMLInputElement;
-              getAutocomplete(vnode.attrs.resource).attach(el);
-
-              el.addEventListener("blur", () => {
-                if (filterTouched) onChange();
-              });
-
-              el.addEventListener("keydown", (e) => {
-                if (e.key === "Enter" && filterTouched) onChange();
-              });
+            onblur: () => {
+              if (filterTouched) onChange();
             },
           });
-        }),
-      ]);
-    },
-  };
-};
 
-export default component;
+          getAutocomplete(attrs.resource).attach(inputEl);
+          // Attach Enter handler after autocomplete so its stopImmediatePropagation
+          // on suggestion-pick can suppress this.
+          inputEl.addEventListener("keydown", (e) => {
+            if (e.key === "Enter" && filterTouched) onChange();
+          });
+          return inputEl;
+        },
+        // Rows are editable inputs keyed by index over raw strings; value and
+        // class read filterList reactively, and an identity-based re-render on
+        // commit would drop focus mid-edit (Enter).
+        // TODO: model rows as stable { id, text: StateSignal } entities keyed
+        // by id (editing writes the row's signal instead of mutating the list
+        // in place); then drop this opt-out.
+        { rerenderOnChange: false },
+      ),
+    ),
+  );
+}

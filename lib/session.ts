@@ -1,3 +1,4 @@
+import { IncomingMessage, ServerResponse } from "node:http";
 import * as device from "./device.ts";
 import * as sandbox from "./sandbox.ts";
 import * as localCache from "./cwmp/local-cache.ts";
@@ -10,6 +11,7 @@ import InstanceSet from "./instance-set.ts";
 import {
   Attributes,
   SessionContext,
+  SyncState,
   DeviceData,
   VirtualParameterDeclaration,
   AttributeTimestamps,
@@ -25,7 +27,6 @@ import {
   TransferCompleteRequest,
   Operation,
   ScriptResult,
-  Expression,
   GetParameterValues,
   GetParameterAttributes,
   GetParameterNames,
@@ -34,6 +35,7 @@ import {
   AddObject,
   DeleteObject,
   Download,
+  Upload,
   Reboot,
   FactoryReset,
   AddObjectResponse,
@@ -42,6 +44,7 @@ import {
 import { getRequestOrigin } from "./forwarded.ts";
 import * as logger from "./logger.ts";
 import { encodeTag } from "./util.ts";
+import Expression, { Value } from "./common/expression.ts";
 
 const VALID_PARAM_TYPES = new Set([
   "xsd:int",
@@ -63,18 +66,61 @@ function initDeviceData(): DeviceData {
   };
 }
 
+function initSyncState(): SyncState {
+  return {
+    refreshAttributes: {
+      exist: new Set(),
+      object: new Set(),
+      writable: new Set(),
+      value: new Set(),
+      notification: new Set(),
+      accessList: new Set(),
+    },
+    spv: new Map(),
+    spa: new Map(),
+    gpn: new Set<Path>(),
+    gpnPatterns: new Map(),
+    tags: new Map(),
+    virtualParameterDeclarations: [],
+    instancesToDelete: new Map(),
+    instancesToCreate: new Map(),
+    downloadsToDelete: new Set(),
+    downloadsToCreate: new InstanceSet(),
+    downloadsValues: new Map(),
+    downloadsDownload: new Map(),
+    uploadsToDelete: new Set(),
+    uploadsToCreate: new InstanceSet(),
+    uploadsValues: new Map(),
+    uploadsUpload: new Map(),
+    reboot: 0,
+    factoryReset: 0,
+  };
+}
+
+function ensureSyncState(sessionContext: SessionContext): SyncState {
+  return (sessionContext.syncState ??= initSyncState());
+}
+
 export function init(
+  sessionId: string,
   deviceId: string,
   cwmpVersion: string,
   timeout: number,
+  httpRequest: IncomingMessage,
+  httpResponse: ServerResponse,
+  cacheSnapshot: string,
 ): SessionContext {
   const timestamp = Date.now();
   const sessionContext: SessionContext = {
+    sessionId,
     timestamp: timestamp,
     deviceId: deviceId,
     deviceData: initDeviceData(),
     cwmpVersion: cwmpVersion,
     timeout: timeout,
+    httpRequest: httpRequest,
+    httpResponse: httpResponse,
+    cacheSnapshot: cacheSnapshot,
     provisions: [],
     channels: {},
     virtualParameters: [],
@@ -86,6 +132,21 @@ export function init(
     declarations: [],
     state: 0,
     authState: 0,
+    faults: {},
+    retries: {},
+    tasks: [],
+    operations: {},
+    faultsTouched: {},
+    operationsTouched: {},
+    provisionsRet: [],
+    presetCycles: 0,
+    lastActivity: 0,
+    extendLock: 0,
+    doneTasks: [],
+    new: false,
+    debug: false,
+    syncState: undefined,
+    rpcRequest: undefined,
   };
 
   return sessionContext;
@@ -102,29 +163,25 @@ function generateRpcId(sessionContext: SessionContext): string {
 export function configContextCallback(
   sessionContext: SessionContext,
   exp: Expression,
-): Expression {
-  if (!Array.isArray(exp)) return exp;
-  if (exp[0] === "PARAM" && typeof exp[1] === "string") {
-    let name = exp[1];
-    if (name === "id") name = "DeviceID.ID";
-    else if (name === "serialNumber") name = "DeviceID.SerialNumber";
-    else if (name === "productClass") name = "DeviceID.ProductClass";
-    else if (name === "oui") name = "DeviceID.OUI";
-    else if (name === "remoteAddress")
-      return getRequestOrigin(sessionContext.httpRequest).remoteAddress;
-
+): Expression.Literal {
+  if (exp instanceof Expression.Literal) return exp;
+  else if (exp instanceof Expression.FunctionCall) {
+    if (exp.name === "NOW")
+      return new Expression.Literal(sessionContext.timestamp);
+    if (exp.name === "REMOTE_ADDRESS")
+      return new Expression.Literal(
+        getRequestOrigin(sessionContext.httpRequest).remoteAddress,
+      );
+  } else if (exp instanceof Expression.Parameter) {
     const deviceData = sessionContext.deviceData;
     const paths = deviceData.paths;
-    const path = paths.get(Path.parse(name));
+    const path = paths.get(exp.path.toString());
     if (path) {
       const attrs = deviceData.attributes.get(path, 1);
-      if (attrs?.value?.[1]) return attrs.value[1][0];
+      if (attrs?.value?.[1]) return new Expression.Literal(attrs.value[1][0]);
     }
-  } else if (exp[0] === "FUNC") {
-    if (exp[1] === "REMOTE_ADDRESS")
-      return getRequestOrigin(sessionContext.httpRequest).remoteAddress;
   }
-  return exp;
+  return new Expression.Literal(null);
 }
 
 export async function inform(
@@ -132,9 +189,9 @@ export async function inform(
   rpcReq: InformRequest,
 ): Promise<AcsResponse> {
   const timestamp = sessionContext.timestamp + sessionContext.iteration + 1;
-  const params: [Path, number, Attributes][] = [
+  const params: [string, number, Attributes][] = [
     [
-      Path.parse("DeviceID.Manufacturer"),
+      "DeviceID.Manufacturer",
       timestamp,
       {
         object: [timestamp, 0],
@@ -144,7 +201,7 @@ export async function inform(
     ],
 
     [
-      Path.parse("DeviceID.OUI"),
+      "DeviceID.OUI",
       timestamp,
       {
         object: [timestamp, 0],
@@ -154,17 +211,17 @@ export async function inform(
     ],
 
     [
-      Path.parse("DeviceID.ProductClass"),
+      "DeviceID.ProductClass",
       timestamp,
       {
         object: [timestamp, 0],
         writable: [timestamp, 0],
-        value: [timestamp, [rpcReq.deviceId.ProductClass, "xsd:string"]],
+        value: [timestamp, [rpcReq.deviceId.ProductClass ?? "", "xsd:string"]],
       },
     ],
 
     [
-      Path.parse("DeviceID.SerialNumber"),
+      "DeviceID.SerialNumber",
       timestamp,
       {
         object: [timestamp, 0],
@@ -177,7 +234,7 @@ export async function inform(
   for (const p of rpcReq.parameterList) {
     const path = p[0];
     params.push([
-      path,
+      path.toString(),
       timestamp,
       {
         object: [timestamp, 0],
@@ -187,7 +244,7 @@ export async function inform(
   }
 
   params.push([
-    Path.parse("Events.Inform"),
+    "Events.Inform",
     timestamp,
     {
       object: [timestamp, 0],
@@ -198,7 +255,7 @@ export async function inform(
 
   for (const e of rpcReq.event) {
     params.push([
-      Path.parse(`Events.${encodeTag(e.replace(/\s+/g, "_"))}`),
+      `Events.${encodeTag(e.replace(/\s+/g, "_"))}`,
       timestamp,
       {
         object: [timestamp, 0],
@@ -210,7 +267,7 @@ export async function inform(
 
   if (sessionContext.new) {
     params.push([
-      Path.parse("DeviceID.ID"),
+      "DeviceID.ID",
       timestamp,
       {
         object: [timestamp, 0],
@@ -219,7 +276,7 @@ export async function inform(
       },
     ]);
     params.push([
-      Path.parse("Events.Registered"),
+      "Events.Registered",
       timestamp,
       {
         object: [timestamp, 0],
@@ -232,10 +289,10 @@ export async function inform(
   sessionContext.deviceData.timestamps.revision = 1;
   sessionContext.deviceData.attributes.revision = 1;
 
-  let toClear = null;
+  let toClear: Clear[] = [];
   for (const p of params) {
     // Don't need to clear wildcards for Events
-    if (p[0].segments[0] === "Events") {
+    if (p[0].startsWith("Events.")) {
       device.set(sessionContext.deviceData, p[0], p[1], p[2]);
     } else {
       toClear = device.set(
@@ -259,7 +316,11 @@ export async function inform(
 export async function transferComplete(
   sessionContext: SessionContext,
   rpcReq: TransferCompleteRequest,
-): Promise<{ acsResponse: AcsResponse; operation: Operation; fault: Fault }> {
+): Promise<{
+  acsResponse: AcsResponse;
+  operation: Operation | null;
+  fault: Fault | null;
+}> {
   const revision =
     (sessionContext.revisions[sessionContext.revisions.length - 1] || 0) + 1;
   sessionContext.deviceData.timestamps.revision = revision;
@@ -278,11 +339,13 @@ export async function transferComplete(
   const instance = operation.args.instance;
 
   delete sessionContext.operations[commandKey];
-  if (!sessionContext.operationsTouched) sessionContext.operationsTouched = {};
   sessionContext.operationsTouched[commandKey] = 1;
 
-  if (rpcReq.faultStruct?.faultCode !== "0") {
-    revertDownloadParameters(sessionContext, operation.args.instance);
+  if (rpcReq.faultStruct && rpcReq.faultStruct.faultCode !== "0") {
+    if (operation.name === "Download")
+      revertDownloadParameters(sessionContext, instance);
+    else if (operation.name === "Upload")
+      revertUploadParameters(sessionContext, instance);
 
     const fault: Fault = {
       code: `cwmp.${rpcReq.faultStruct.faultCode}`,
@@ -298,76 +361,26 @@ export async function transferComplete(
     };
   }
 
-  let toClear = null;
+  let toClear: Clear[] = [];
   const timestamp = sessionContext.timestamp + sessionContext.iteration + 1;
 
-  let p;
-
-  p = sessionContext.deviceData.paths.add(
-    Path.parse(`Downloads.${instance}.LastDownload`),
-  );
-  toClear = device.set(
-    sessionContext.deviceData,
-    p,
-    timestamp,
-    { value: [timestamp, [operation.timestamp, "xsd:dateTime"]] },
-    toClear,
-  );
-
-  p = sessionContext.deviceData.paths.add(
-    Path.parse(`Downloads.${instance}.LastFileType`),
-  );
-  toClear = device.set(
-    sessionContext.deviceData,
-    p,
-    timestamp,
-    { value: [timestamp, [operation.args.fileType, "xsd:string"]] },
-    toClear,
-  );
-
-  p = sessionContext.deviceData.paths.add(
-    Path.parse(`Downloads.${instance}.LastFileName`),
-  );
-  toClear = device.set(
-    sessionContext.deviceData,
-    p,
-    timestamp,
-    { value: [timestamp, [operation.args.fileName, "xsd:string"]] },
-    toClear,
-  );
-
-  p = sessionContext.deviceData.paths.add(
-    Path.parse(`Downloads.${instance}.LastTargetFileName`),
-  );
-  toClear = device.set(
-    sessionContext.deviceData,
-    p,
-    timestamp,
-    { value: [timestamp, [operation.args.targetFileName, "xsd:string"]] },
-    toClear,
-  );
-
-  p = sessionContext.deviceData.paths.add(
-    Path.parse(`Downloads.${instance}.StartTime`),
-  );
-  toClear = device.set(
-    sessionContext.deviceData,
-    p,
-    timestamp,
-    { value: [timestamp, [+rpcReq.startTime, "xsd:dateTime"]] },
-    toClear,
-  );
-
-  p = sessionContext.deviceData.paths.add(
-    Path.parse(`Downloads.${instance}.CompleteTime`),
-  );
-  toClear = device.set(
-    sessionContext.deviceData,
-    p,
-    timestamp,
-    { value: [timestamp, [+rpcReq.completeTime, "xsd:dateTime"]] },
-    toClear,
-  );
+  if (operation.name === "Download") {
+    toClear = commitDownloadOperation(
+      sessionContext,
+      operation,
+      rpcReq,
+      timestamp,
+      toClear,
+    );
+  } else if (operation.name === "Upload") {
+    toClear = commitUploadOperation(
+      sessionContext,
+      operation,
+      rpcReq,
+      timestamp,
+      toClear,
+    );
+  }
 
   if (toClear) {
     for (const c of toClear)
@@ -381,27 +394,164 @@ export async function transferComplete(
   };
 }
 
+function commitDownloadOperation(
+  sessionContext: SessionContext,
+  operation: Operation,
+  rpcReq: TransferCompleteRequest,
+  timestamp: number,
+  toClear: Clear[],
+): Clear[] {
+  const instance = operation.args.instance;
+  toClear = device.set(
+    sessionContext.deviceData,
+    `Downloads.${instance}.LastDownload`,
+    timestamp,
+    { value: [timestamp, [operation.timestamp, "xsd:dateTime"]] },
+    toClear,
+  );
+
+  toClear = device.set(
+    sessionContext.deviceData,
+    `Downloads.${instance}.LastFileType`,
+    timestamp,
+    { value: [timestamp, [operation.args.fileType, "xsd:string"]] },
+    toClear,
+  );
+
+  toClear = device.set(
+    sessionContext.deviceData,
+    `Downloads.${instance}.LastFileName`,
+    timestamp,
+    { value: [timestamp, [operation.args.fileName, "xsd:string"]] },
+    toClear,
+  );
+
+  toClear = device.set(
+    sessionContext.deviceData,
+    `Downloads.${instance}.LastTargetFileName`,
+    timestamp,
+    { value: [timestamp, [operation.args.targetFileName ?? "", "xsd:string"]] },
+    toClear,
+  );
+
+  toClear = device.set(
+    sessionContext.deviceData,
+    `Downloads.${instance}.StartTime`,
+    timestamp,
+    { value: [timestamp, [rpcReq.startTime ?? 0, "xsd:dateTime"]] },
+    toClear,
+  );
+
+  toClear = device.set(
+    sessionContext.deviceData,
+    `Downloads.${instance}.CompleteTime`,
+    timestamp,
+    { value: [timestamp, [rpcReq.completeTime ?? 0, "xsd:dateTime"]] },
+    toClear,
+  );
+
+  return toClear;
+}
+
+function commitUploadOperation(
+  sessionContext: SessionContext,
+  operation: Operation,
+  rpcReq: TransferCompleteRequest,
+  timestamp: number,
+  toClear: Clear[],
+): Clear[] {
+  const instance = operation.args.instance;
+
+  toClear = device.set(
+    sessionContext.deviceData,
+    `Uploads.${instance}.LastUpload`,
+    timestamp,
+    { value: [timestamp, [operation.timestamp, "xsd:dateTime"]] },
+    toClear,
+  );
+
+  toClear = device.set(
+    sessionContext.deviceData,
+    `Uploads.${instance}.LastFileType`,
+    timestamp,
+    { value: [timestamp, [operation.args.fileType, "xsd:string"]] },
+    toClear,
+  );
+
+  toClear = device.set(
+    sessionContext.deviceData,
+    `Uploads.${instance}.LastFileName`,
+    timestamp,
+    { value: [timestamp, [operation.args.fileName, "xsd:string"]] },
+    toClear,
+  );
+
+  toClear = device.set(
+    sessionContext.deviceData,
+    `Uploads.${instance}.StartTime`,
+    timestamp,
+    { value: [timestamp, [rpcReq.startTime ?? 0, "xsd:dateTime"]] },
+    toClear,
+  );
+
+  toClear = device.set(
+    sessionContext.deviceData,
+    `Uploads.${instance}.CompleteTime`,
+    timestamp,
+    { value: [timestamp, [rpcReq.completeTime ?? 0, "xsd:dateTime"]] },
+    toClear,
+  );
+
+  return toClear;
+}
+
+function revertUploadParameters(
+  sessionContext: SessionContext,
+  instance: string,
+): void {
+  const timestamp = sessionContext.timestamp + sessionContext.iteration + 1;
+  const lastUploadPath = sessionContext.deviceData.paths.add(
+    `Uploads.${instance}.LastUpload`,
+  );
+
+  const lastUpload = sessionContext.deviceData.attributes.get(lastUploadPath);
+
+  const toClear = device.set(
+    sessionContext.deviceData,
+    `Uploads.${instance}.Upload`,
+    timestamp,
+    {
+      value: [timestamp, [lastUpload?.value?.[1]?.[0] || 0, "xsd:dateTime"]],
+    },
+  );
+
+  if (toClear) {
+    for (const c of toClear)
+      device.clear(sessionContext.deviceData, c[0], c[1], c[2], c[3]);
+  }
+}
+
 function revertDownloadParameters(
   sessionContext: SessionContext,
-  instance,
+  instance: string,
 ): void {
   const timestamp = sessionContext.timestamp + sessionContext.iteration + 1;
 
-  let p;
-
-  p = sessionContext.deviceData.paths.add(
-    Path.parse(`Downloads.${instance}.LastDownload`),
+  const lastDownloadPath = sessionContext.deviceData.paths.add(
+    `Downloads.${instance}.LastDownload`,
   );
 
-  const lastDownload = sessionContext.deviceData.attributes.get(p);
+  const lastDownload =
+    sessionContext.deviceData.attributes.get(lastDownloadPath);
 
-  p = sessionContext.deviceData.paths.add(
-    Path.parse(`Downloads.${instance}.Download`),
+  const toClear = device.set(
+    sessionContext.deviceData,
+    `Downloads.${instance}.Download`,
+    timestamp,
+    {
+      value: [timestamp, [lastDownload?.value?.[1]?.[0] || 0, "xsd:dateTime"]],
+    },
   );
-
-  const toClear = device.set(sessionContext.deviceData, p, timestamp, {
-    value: [timestamp, [lastDownload?.value[1]?.[0] || 0, "xsd:dateTime"]],
-  });
 
   if (toClear) {
     for (const c of toClear)
@@ -422,62 +572,88 @@ export async function timeoutOperations(
   for (const [commandKey, operation] of Object.entries(
     sessionContext.operations,
   )) {
-    if (operation.name !== "Download")
-      throw new Error(`Unknown operation name ${operation.name}`);
+    if (operation.name === "Download") {
+      const DOWNLOAD_TIMEOUT =
+        localCache.getConfig(
+          sessionContext.cacheSnapshot,
+          "cwmp.downloadTimeout",
+          3600,
+          (e) => configContextCallback(sessionContext, e),
+        ) * 1000;
 
-    const DOWNLOAD_TIMEOUT =
-      +localCache.getConfig(
-        sessionContext.cacheSnapshot,
-        "cwmp.downloadTimeout",
-        {},
-        sessionContext.timestamp,
-        (e) => configContextCallback(sessionContext, e),
-      ) * 1000;
+      if (sessionContext.timestamp < operation.timestamp + DOWNLOAD_TIMEOUT)
+        continue;
 
-    if (sessionContext.timestamp < operation.timestamp + DOWNLOAD_TIMEOUT)
-      continue;
-
-    logger.accessWarn({
-      sessionContext: sessionContext,
-      message: "Download operation timed out",
-      commandKey: commandKey,
-    });
-
-    const SUCCESS_ON_TIMEOUT = +localCache.getConfig(
-      sessionContext.cacheSnapshot,
-      "cwmp.downloadSuccessOnTimeout",
-      {},
-      sessionContext.timestamp,
-      (e) => configContextCallback(sessionContext, e),
-    );
-
-    if (SUCCESS_ON_TIMEOUT) {
-      const r = {
-        name: "TransferComplete" as const,
+      logger.accessWarn({
+        sessionContext: sessionContext,
+        message: "Download operation timed out",
         commandKey: commandKey,
-        startTime: 0,
-        completeTime: 0,
-      };
+      });
 
-      // Call transferComplete code and ignore the response
-      await transferComplete(sessionContext, r);
-      continue;
+      const SUCCESS_ON_TIMEOUT = localCache.getConfig(
+        sessionContext.cacheSnapshot,
+        "cwmp.downloadSuccessOnTimeout",
+        false,
+        (e) => configContextCallback(sessionContext, e),
+      );
+
+      if (SUCCESS_ON_TIMEOUT) {
+        const r = {
+          name: "TransferComplete" as const,
+          commandKey: commandKey,
+          startTime: 0,
+          completeTime: 0,
+        };
+
+        // Call transferComplete code and ignore the response
+        await transferComplete(sessionContext, r);
+        continue;
+      }
+
+      delete sessionContext.operations[commandKey];
+      sessionContext.operationsTouched[commandKey] = 1;
+
+      faults.push({
+        code: "timeout",
+        message: "Download operation timed out",
+        timestamp: operation.timestamp,
+      });
+
+      operations.push(operation);
+
+      revertDownloadParameters(sessionContext, operation.args.instance);
+    } else if (operation.name === "Upload") {
+      const UPLOAD_TIMEOUT =
+        localCache.getConfig(
+          sessionContext.cacheSnapshot,
+          "cwmp.uploadTimeout",
+          3600,
+          (e) => configContextCallback(sessionContext, e),
+        ) * 1000;
+
+      if (sessionContext.timestamp >= operation.timestamp + UPLOAD_TIMEOUT) {
+        logger.accessWarn({
+          sessionContext: sessionContext,
+          message: "Upload operation timed out",
+          commandKey: commandKey,
+        });
+
+        delete sessionContext.operations[commandKey];
+        sessionContext.operationsTouched[commandKey] = 1;
+
+        faults.push({
+          code: "timeout",
+          message: "Upload operation timed out",
+          timestamp: operation.timestamp,
+        });
+
+        operations.push(operation);
+
+        revertUploadParameters(sessionContext, operation.args.instance);
+      }
+    } else {
+      throw new Error(`Unknown operation name ${operation.name}`);
     }
-
-    delete sessionContext.operations[commandKey];
-    if (!sessionContext.operationsTouched)
-      sessionContext.operationsTouched = {};
-    sessionContext.operationsTouched[commandKey] = 1;
-
-    faults.push({
-      code: "timeout",
-      message: "Download operation timed out",
-      timestamp: operation.timestamp,
-    });
-
-    operations.push(operation);
-
-    revertDownloadParameters(sessionContext, operation.args.instance);
   }
 
   return { faults, operations };
@@ -486,16 +662,15 @@ export async function timeoutOperations(
 export function addProvisions(
   sessionContext: SessionContext,
   channel: string,
-  provisions: [string, ...Expression[]][],
+  provisions: [string, ...Value[]][],
 ): void {
   // Multiply by two because every iteration is two
   // phases: read and update
   const MAX_ITERATIONS =
-    +localCache.getConfig(
+    localCache.getConfig(
       sessionContext.cacheSnapshot,
       "cwmp.maxCommitIterations",
-      {},
-      sessionContext.timestamp,
+      32,
       (e) => configContextCallback(sessionContext, e),
     ) * 2;
 
@@ -549,8 +724,7 @@ export function clearProvisions(sessionContext: SessionContext): void {
     +localCache.getConfig(
       sessionContext.cacheSnapshot,
       "cwmp.maxCommitIterations",
-      {},
-      sessionContext.timestamp,
+      32,
       (e) => configContextCallback(sessionContext, e),
     ) * 2;
 
@@ -578,7 +752,7 @@ export function clearProvisions(sessionContext: SessionContext): void {
 
 async function runProvisions(
   sessionContext: SessionContext,
-  provisions: any[][],
+  provisions: [string, ...Value[]][],
   startRevision: number,
   endRevision: number,
 ): Promise<ScriptResult> {
@@ -586,13 +760,15 @@ async function runProvisions(
 
   const res = await Promise.all(
     provisions.map(async (provision) => {
-      if (!allProvisions[provision[0]]) {
-        if (defaultProvisions[provision[0]]) {
-          const dec = [];
+      if (!allProvisions[provision[0] as string]) {
+        const defaultProvision =
+          defaultProvisions[provision[0] as keyof typeof defaultProvisions];
+        if (defaultProvision) {
+          const dec: Declaration[] = [];
           let done = true;
           let fault = null;
           try {
-            done = defaultProvisions[provision[0]](
+            done = defaultProvision(
               sessionContext,
               provision,
               dec,
@@ -600,6 +776,7 @@ async function runProvisions(
               endRevision,
             );
           } catch (err) {
+            if (!(err instanceof Error)) throw err;
             fault = {
               code: `script.${err.name}`,
               message: err.message,
@@ -616,7 +793,7 @@ async function runProvisions(
             declare: dec,
             done: done,
             returnValue: null,
-          };
+          } as ScriptResult;
         }
         return null;
       }
@@ -632,9 +809,9 @@ async function runProvisions(
   );
 
   let done = true;
-  let allDeclarations = [];
-  let allClear = [];
-  let fault;
+  let allDeclarations: Declaration[] = [];
+  let allClear: Clear[] = [];
+  let fault: Fault | null = null;
 
   for (const r of res) {
     if (!r) continue;
@@ -657,7 +834,13 @@ async function runProvisions(
 
 async function runVirtualParameters(
   sessionContext: SessionContext,
-  provisions: any[][],
+  provisions: [
+    string,
+    AttributeTimestamps,
+    AttributeValues,
+    AttributeTimestamps,
+    AttributeValues,
+  ][],
   startRevision: number,
   endRevision: number,
 ): Promise<ScriptResult> {
@@ -707,7 +890,8 @@ async function runVirtualParameters(
         }
 
         if (r.returnValue.value != null) {
-          let v: string | number | boolean, t: string;
+          let v: string | number | boolean;
+          let t: string | undefined;
 
           if (Array.isArray(r.returnValue.value)) [v, t] = r.returnValue.value;
           else v = r.returnValue.value;
@@ -727,7 +911,10 @@ async function runVirtualParameters(
             return r;
           }
 
-          ret.value = device.sanitizeParameterValue([v, t]);
+          ret.value = device.sanitizeParameterValue([v, t]) as [
+            string | number | boolean,
+            string?,
+          ];
         } else if (provision[1].value != null || provision[2].value != null) {
           r.fault = {
             code: "script",
@@ -743,10 +930,10 @@ async function runVirtualParameters(
   );
 
   let done = true;
-  const virtualParameterUpdates = [];
-  let allDeclarations = [];
-  let allClear = [];
-  let fault;
+  const virtualParameterUpdates: (AttributeValues | null)[] = [];
+  let allDeclarations: Declaration[] = [];
+  let allClear: Clear[] = [];
+  let fault: Fault | null = null;
 
   for (const r of res) {
     if (!r) {
@@ -776,32 +963,7 @@ function runDeclarations(
   sessionContext: SessionContext,
   declarations: Declaration[],
 ): VirtualParameterDeclaration[] {
-  if (!sessionContext.syncState) {
-    sessionContext.syncState = {
-      refreshAttributes: {
-        exist: new Set(),
-        object: new Set(),
-        writable: new Set(),
-        value: new Set(),
-        notification: new Set(),
-        accessList: new Set(),
-      },
-      spv: new Map(),
-      spa: new Map(),
-      gpn: new Set<Path>(),
-      gpnPatterns: new Map(),
-      tags: new Map(),
-      virtualParameterDeclarations: [],
-      instancesToDelete: new Map(),
-      instancesToCreate: new Map(),
-      downloadsToDelete: new Set(),
-      downloadsToCreate: new InstanceSet(),
-      downloadsValues: new Map(),
-      downloadsDownload: new Map(),
-      reboot: 0,
-      factoryReset: 0,
-    };
-  }
+  ensureSyncState(sessionContext);
 
   const allDeclareTimestamps = new Map<Path, number>();
   const allDeclareAttributeTimestamps = new Map<Path, AttributeTimestamps>();
@@ -817,7 +979,10 @@ function runDeclarations(
       allDeclareAttributeTimestamps.set(p, attrs);
     } else {
       cur = Object.assign({}, cur);
-      for (const [k, v] of Object.entries(attrs))
+      for (const [k, v] of Object.entries(attrs) as [
+        keyof AttributeTimestamps,
+        number,
+      ][])
         cur[k] = Math.max(v, cur[k] || 0);
       allDeclareAttributeTimestamps.set(p, cur);
     }
@@ -839,7 +1004,7 @@ function runDeclarations(
 
   for (const declaration of declarations) {
     let path = declaration.path;
-    let unpacked: Path[];
+    let unpacked: Path[] | undefined;
 
     // Can't run declarations on root
     if (!path.length) continue;
@@ -848,22 +1013,20 @@ function runDeclarations(
       (path.alias | path.wildcard) & 1 ||
       path.segments[0] === "VirtualParameters"
     ) {
-      sessionContext.deviceData.paths.add(Path.parse("VirtualParameters"));
+      sessionContext.deviceData.paths.add("VirtualParameters");
       if ((path.alias | path.wildcard) & 2) {
-        sessionContext.deviceData.paths.add(Path.parse("VirtualParameters.*"));
+        sessionContext.deviceData.paths.add("VirtualParameters.*");
         for (const k of Object.keys(allVirtualParameters)) {
-          sessionContext.deviceData.paths.add(
-            Path.parse(`VirtualParameters.${k}`),
-          );
+          sessionContext.deviceData.paths.add(`VirtualParameters.${k}`);
         }
       }
     }
 
     if ((path.alias | path.wildcard) & 1 || path.segments[0] === "Reboot")
-      sessionContext.deviceData.paths.add(Path.parse("Reboot"));
+      sessionContext.deviceData.paths.add("Reboot");
 
     if ((path.alias | path.wildcard) & 1 || path.segments[0] === "FactoryReset")
-      sessionContext.deviceData.paths.add(Path.parse("FactoryReset"));
+      sessionContext.deviceData.paths.add("FactoryReset");
 
     if (path.alias) {
       const aliasDecs = device.getAliasDeclarations(
@@ -871,12 +1034,12 @@ function runDeclarations(
         declaration.pathGet || 1,
       );
       for (const ad of aliasDecs) {
-        const p = sessionContext.deviceData.paths.add(ad.path);
+        const p = sessionContext.deviceData.paths.add(ad.path.toString());
         allDeclareTimestamps.set(
           p,
           Math.max(ad.pathGet || 1, allDeclareTimestamps.get(p) || 0),
         );
-        let attrTrackers;
+        let attrTrackers: string[] | undefined;
         if (ad.attrGet) {
           attrTrackers = Object.keys(ad.attrGet);
           mergeAttributeTimestamps(p, ad.attrGet);
@@ -884,7 +1047,7 @@ function runDeclarations(
 
         device.track(
           sessionContext.deviceData,
-          p,
+          p.toString(),
           "prerequisite",
           attrTrackers,
         );
@@ -900,14 +1063,14 @@ function runDeclarations(
           mergeAttributeTimestamps(u, declaration.attrGet);
       }
     } else {
-      path = sessionContext.deviceData.paths.add(path);
+      path = sessionContext.deviceData.paths.add(path.toString());
       allDeclareTimestamps.set(
         path,
         Math.max(declaration.pathGet || 1, allDeclareTimestamps.get(path) || 0),
       );
       if (declaration.attrGet)
         mergeAttributeTimestamps(path, declaration.attrGet);
-      device.track(sessionContext.deviceData, path, "prerequisite");
+      device.track(sessionContext.deviceData, path.toString(), "prerequisite");
     }
 
     if (declaration.attrSet) {
@@ -928,7 +1091,7 @@ function runDeclarations(
     }
 
     if (declaration.pathSet != null) {
-      let minInstances, maxInstances;
+      let minInstances: number, maxInstances: number;
       if (Array.isArray(declaration.pathSet)) {
         minInstances = declaration.pathSet[0];
         maxInstances = declaration.pathSet[1];
@@ -938,17 +1101,16 @@ function runDeclarations(
 
       let parent = path.slice(0, -1);
 
-      let keys;
-      if (Array.isArray(path.segments[path.length - 1])) {
-        keys = {};
-        for (const [p, v] of path.segments[path.length - 1])
-          keys[p.toString()] = v;
-      } else if (path.segments[path.length - 1] === "*") {
-        keys = {};
+      const keys: Record<string, string> = {};
+      if (path.segments[path.length - 1] instanceof Expression) {
+        for (const [p, v] of device.expressionToAlias(
+          path.segments[path.length - 1] as Expression,
+        ))
+          keys[p.toString()] = v as string;
       }
 
       if (!parent.wildcard && !parent.alias) {
-        parent = sessionContext.deviceData.paths.add(parent);
+        parent = sessionContext.deviceData.paths.add(parent.toString());
         if (!unpacked)
           unpacked = device.unpack(sessionContext.deviceData, path);
 
@@ -1004,8 +1166,12 @@ function runDeclarations(
 
 export async function rpcRequest(
   sessionContext: SessionContext,
-  _declarations: Declaration[],
-): Promise<{ fault: Fault; rpcId: string; rpc: AcsRequest }> {
+  _declarations: Declaration[] | null,
+): Promise<{
+  fault: Fault | null;
+  rpcId: string | null;
+  rpc: AcsRequest | null;
+}> {
   if (sessionContext.rpcRequest != null) {
     return {
       fault: null,
@@ -1031,63 +1197,71 @@ export async function rpcRequest(
     sessionContext.deviceData.timestamps.revision = revision;
     sessionContext.deviceData.attributes.revision = revision;
 
-    let run: typeof runProvisions, provisions;
-    if (inception === 0) {
-      run = runProvisions;
-      provisions = sessionContext.provisions;
-    } else {
-      run = runVirtualParameters;
-      provisions = sessionContext.virtualParameters[inception - 1];
-    }
-
+    const startRev = sessionContext.revisions[inception - 1] || 0;
+    const endRev = sessionContext.revisions[inception];
     const {
       fault,
       clear: toClear,
       declare: decs,
       done: done,
       returnValue: ret,
-    } = await run(
-      sessionContext,
-      provisions,
-      sessionContext.revisions[inception - 1] || 0,
-      sessionContext.revisions[inception],
-    );
+    } = await (inception === 0
+      ? runProvisions(
+          sessionContext,
+          sessionContext.provisions,
+          startRev,
+          endRev,
+        )
+      : runVirtualParameters(
+          sessionContext,
+          sessionContext.virtualParameters[inception - 1],
+          startRev,
+          endRev,
+        ));
 
     if (fault) {
       fault.timestamp = sessionContext.timestamp;
       return { fault: fault, rpcId: null, rpc: null };
     }
 
+    const cleared = toClear ?? [];
+    const declares = decs ?? [];
+
     // Enforce max clear timestamp
-    for (const c of toClear) {
+    for (const c of cleared) {
       if (c[1] > sessionContext.timestamp) c[1] = sessionContext.timestamp;
 
       if (c[2]) {
-        for (const [k, v] of Object.entries(c[2]))
+        for (const [k, v] of Object.entries(c[2]) as [
+          keyof AttributeTimestamps,
+          number,
+        ][])
           if (v > sessionContext.timestamp) c[2][k] = sessionContext.timestamp;
       }
     }
 
-    sessionContext.declarations.push(decs);
+    sessionContext.declarations.push(declares);
+    if (!sessionContext.provisionsRet) sessionContext.provisionsRet = [];
     sessionContext.provisionsRet[inception] = inception ? ret : done;
 
-    for (const d of decs) {
+    for (const d of declares) {
       // Enforce max timestamp
       if (d.pathGet > sessionContext.timestamp)
         d.pathGet = sessionContext.timestamp;
 
       if (d.attrGet) {
-        for (const [k, v] of Object.entries(d.attrGet)) {
+        for (const [k, v] of Object.entries(d.attrGet) as [
+          keyof AttributeTimestamps,
+          number,
+        ][]) {
           if (v > sessionContext.timestamp)
             d.attrGet[k] = sessionContext.timestamp;
         }
       }
     }
 
-    if (toClear) {
-      for (const c of toClear)
-        device.clear(sessionContext.deviceData, c[0], c[1], c[2], c[3]);
-    }
+    for (const c of cleared)
+      device.clear(sessionContext.deviceData, c[0], c[1], c[2], c[3]);
 
     return rpcRequest(sessionContext, _declarations);
   }
@@ -1143,8 +1317,7 @@ export async function rpcRequest(
     +localCache.getConfig(
       sessionContext.cacheSnapshot,
       "cwmp.maxCommitIterations",
-      {},
-      sessionContext.timestamp,
+      32,
       (e) => configContextCallback(sessionContext, e),
     ) * 2;
 
@@ -1182,9 +1355,10 @@ export async function rpcRequest(
       sessionContext,
       sessionContext.declarations[inception],
     );
+    const syncState = ensureSyncState(sessionContext);
     const timestamp = sessionContext.timestamp + sessionContext.iteration;
 
-    let toClear;
+    let toClear: Clear[] | undefined;
 
     const allVirtualParameters = localCache.getVirtualParameters(
       sessionContext.cacheSnapshot,
@@ -1198,7 +1372,7 @@ export async function rpcRequest(
           if (!sessionContext.deviceData.attributes.has(declaration[0])) {
             toClear = device.set(
               sessionContext.deviceData,
-              declaration[0],
+              declaration[0].toString(),
               timestamp,
               { object: [timestamp, 1], writable: [timestamp, 0] },
               toClear,
@@ -1211,7 +1385,7 @@ export async function rpcRequest(
             for (const k of Object.keys(allVirtualParameters)) {
               toClear = device.set(
                 sessionContext.deviceData,
-                Path.parse(`VirtualParameters.${k}`),
+                `VirtualParameters.${k}`,
                 timestamp,
                 {
                   object: [timestamp, 0],
@@ -1221,9 +1395,9 @@ export async function rpcRequest(
             }
             toClear = device.set(
               sessionContext.deviceData,
-              declaration[0],
+              declaration[0].toString(),
               timestamp,
-              null,
+              undefined,
               toClear,
             );
             return false;
@@ -1235,7 +1409,7 @@ export async function rpcRequest(
             if (!sessionContext.deviceData.attributes.has(declaration[0])) {
               toClear = device.set(
                 sessionContext.deviceData,
-                declaration[0],
+                declaration[0].toString(),
                 timestamp,
                 { object: [timestamp, 0] },
                 toClear,
@@ -1247,7 +1421,7 @@ export async function rpcRequest(
         }
       }
 
-      for (const p of sessionContext.deviceData.paths.find(
+      for (const p of sessionContext.deviceData.paths.findCompat(
         declaration[0],
         false,
         true,
@@ -1266,21 +1440,23 @@ export async function rpcRequest(
         device.clear(sessionContext.deviceData, c[0], c[1], c[2], c[3]);
     }
 
-    sessionContext.syncState.virtualParameterDeclarations[inception] = vpd;
+    syncState.virtualParameterDeclarations[inception] = vpd;
     return rpcRequest(sessionContext, null);
   }
 
-  if (!sessionContext.syncState) return { fault: null, rpcId: null, rpc: null };
+  const syncState = sessionContext.syncState;
+  if (!syncState) return { fault: null, rpcId: null, rpc: null };
 
   const inception = sessionContext.declarations.length - 1;
 
   let provisions = generateGetVirtualParameterProvisions(
     sessionContext,
-    sessionContext.syncState.virtualParameterDeclarations[inception],
+    syncState.virtualParameterDeclarations[inception],
   );
 
   if (!provisions) {
-    sessionContext.rpcRequest = generateGetRpcRequest(sessionContext);
+    sessionContext.rpcRequest =
+      generateGetRpcRequest(sessionContext) ?? undefined;
     if (!sessionContext.rpcRequest) {
       // Only check after read stage is complete to minimize reprocessing of
       // declarations especially during initial discovery of data model
@@ -1290,16 +1466,16 @@ export async function rpcRequest(
         return rpcRequest(sessionContext, null);
       }
 
-      let toClear;
+      let toClear: Clear[] | undefined;
       const timestamp = sessionContext.timestamp + sessionContext.iteration + 1;
 
       // Update tags
-      for (const [p, v] of sessionContext.syncState.tags) {
+      for (const [p, v] of syncState.tags) {
         const c = sessionContext.deviceData.attributes.get(p);
         if (v && !c) {
           toClear = device.set(
             sessionContext.deviceData,
-            p,
+            p.toString(),
             timestamp,
             {
               object: [timestamp, 0],
@@ -1311,20 +1487,21 @@ export async function rpcRequest(
         } else if (c && !v) {
           toClear = device.set(
             sessionContext.deviceData,
-            p,
+            p.toString(),
             timestamp,
-            null,
+            undefined,
             toClear,
           );
         }
       }
 
       // Downloads
-      let index;
-      for (const instance of sessionContext.syncState.downloadsToCreate) {
-        if (index == null) {
-          index = 0;
-          for (const p of sessionContext.deviceData.paths.find(
+      let index = 0;
+      let indexInited = false;
+      for (const instance of syncState.downloadsToCreate) {
+        if (!indexInited) {
+          indexInited = true;
+          for (const p of sessionContext.deviceData.paths.findCompat(
             Path.parse("Downloads.*"),
             false,
             true,
@@ -1341,7 +1518,7 @@ export async function rpcRequest(
 
         toClear = device.set(
           sessionContext.deviceData,
-          Path.parse("Downloads"),
+          "Downloads",
           timestamp,
           { object: [timestamp, 1], writable: [timestamp, 1] },
           toClear,
@@ -1349,7 +1526,7 @@ export async function rpcRequest(
 
         toClear = device.set(
           sessionContext.deviceData,
-          Path.parse(`Downloads.${index}`),
+          `Downloads.${index}`,
           timestamp,
           { object: [timestamp, 1], writable: [timestamp, 1] },
           toClear,
@@ -1383,7 +1560,7 @@ export async function rpcRequest(
         for (const [k, v] of Object.entries(params)) {
           toClear = device.set(
             sessionContext.deviceData,
-            Path.parse(`Downloads.${index}.${k}`),
+            `Downloads.${index}.${k}`,
             timestamp,
             {
               object: [timestamp, 0],
@@ -1399,40 +1576,165 @@ export async function rpcRequest(
 
         toClear = device.set(
           sessionContext.deviceData,
-          Path.parse(`Downloads.${index}.*`),
+          `Downloads.${index}.*`,
           timestamp,
-          null,
+          undefined,
           toClear,
         );
       }
 
-      sessionContext.syncState.downloadsToCreate.clear();
+      syncState.downloadsToCreate.clear();
 
-      for (const instance of sessionContext.syncState.downloadsToDelete) {
+      for (const instance of syncState.downloadsToDelete) {
         toClear = device.set(
           sessionContext.deviceData,
-          instance,
+          instance.toString(),
           timestamp,
-          null,
+          undefined,
           toClear,
         );
-        for (const p of sessionContext.syncState.downloadsValues.keys()) {
+        for (const p of syncState.downloadsValues.keys()) {
           if (p.segments[1] === instance.segments[1])
-            sessionContext.syncState.downloadsValues.delete(p);
+            syncState.downloadsValues.delete(p);
         }
       }
 
-      sessionContext.syncState.downloadsToDelete.clear();
+      syncState.downloadsToDelete.clear();
 
-      for (const [p, v] of sessionContext.syncState.downloadsValues) {
+      for (const [p, v] of syncState.downloadsValues) {
         const attrs = sessionContext.deviceData.attributes.get(p);
         if (attrs) {
           if (attrs.writable?.[1] && attrs.value) {
-            const val = device.sanitizeParameterValue([v, attrs.value[1][1]]);
+            const val = device.sanitizeParameterValue([
+              v,
+              attrs.value[1][1],
+            ]) as [string | number | boolean, string];
             if (val[0] !== attrs.value[1][0]) {
               toClear = device.set(
                 sessionContext.deviceData,
-                p,
+                p.toString(),
+                timestamp,
+                { value: [timestamp, val] },
+                toClear,
+              );
+            }
+          }
+        }
+      }
+
+      // Uploads
+      let upIdx = 0;
+      let uploadIndexInit = false;
+      for (const instance of syncState.uploadsToCreate) {
+        if (!uploadIndexInit) {
+          uploadIndexInit = true;
+          for (const p of sessionContext.deviceData.paths.findCompat(
+            Path.parse("Uploads.*"),
+            false,
+            true,
+          )) {
+            if (
+              +p.segments[1] > upIdx &&
+              sessionContext.deviceData.attributes.has(p)
+            )
+              upIdx = +p.segments[1];
+          }
+        }
+
+        ++upIdx;
+
+        toClear = device.set(
+          sessionContext.deviceData,
+          "Uploads",
+          timestamp,
+          { object: [timestamp, 1], writable: [timestamp, 1] },
+          toClear,
+        );
+
+        toClear = device.set(
+          sessionContext.deviceData,
+          `Uploads.${upIdx}`,
+          timestamp,
+          { object: [timestamp, 1], writable: [timestamp, 1] },
+          toClear,
+        );
+
+        const params = {
+          FileType: {
+            writable: 1,
+            value: [instance.FileType || "", "xsd:string"],
+          },
+          FileName: {
+            writable: 1,
+            value: [instance.FileName || "", "xsd:string"],
+          },
+          Upload: {
+            writable: 1,
+            value: [instance.Upload || 0, "xsd:dateTime"],
+          },
+          LastFileType: { writable: 0, value: ["", "xsd:string"] },
+          LastFileName: { writable: 0, value: ["", "xsd:string"] },
+          LastUpload: { writable: 0, value: [0, "xsd:dateTime"] },
+          StartTime: { writable: 0, value: [0, "xsd:dateTime"] },
+          CompleteTime: { writable: 0, value: [0, "xsd:dateTime"] },
+        };
+
+        for (const [k, v] of Object.entries(params)) {
+          toClear = device.set(
+            sessionContext.deviceData,
+            `Uploads.${upIdx}.${k}`,
+            timestamp,
+            {
+              object: [timestamp, 0],
+              writable: [timestamp, v.writable as 0 | 1],
+              value: [
+                timestamp,
+                v.value as [string | number | boolean, string],
+              ],
+            },
+            toClear,
+          );
+        }
+
+        toClear = device.set(
+          sessionContext.deviceData,
+          `Uploads.${upIdx}.*`,
+          timestamp,
+          undefined,
+          toClear,
+        );
+      }
+
+      syncState.uploadsToCreate.clear();
+
+      for (const instance of syncState.uploadsToDelete) {
+        toClear = device.set(
+          sessionContext.deviceData,
+          instance.toString(),
+          timestamp,
+          undefined,
+          toClear,
+        );
+        for (const p of syncState.uploadsValues.keys()) {
+          if (p.segments[1] === instance.segments[1])
+            syncState.uploadsValues.delete(p);
+        }
+      }
+
+      syncState.uploadsToDelete.clear();
+
+      for (const [p, v] of syncState.uploadsValues) {
+        const attrs = sessionContext.deviceData.attributes.get(p);
+        if (attrs) {
+          if (attrs.writable && attrs.writable[1] && attrs.value) {
+            const val = device.sanitizeParameterValue([
+              v,
+              attrs.value[1][1],
+            ]) as [string | number | boolean, string];
+            if (val[0] !== attrs.value[1][0]) {
+              toClear = device.set(
+                sessionContext.deviceData,
+                p.toString(),
                 timestamp,
                 { value: [timestamp, val] },
                 toClear,
@@ -1452,10 +1754,11 @@ export async function rpcRequest(
 
       provisions = generateSetVirtualParameterProvisions(
         sessionContext,
-        sessionContext.syncState.virtualParameterDeclarations[inception],
+        syncState.virtualParameterDeclarations[inception],
       );
       if (!provisions)
-        sessionContext.rpcRequest = generateSetRpcRequest(sessionContext);
+        sessionContext.rpcRequest =
+          generateSetRpcRequest(sessionContext) ?? undefined;
     }
   }
 
@@ -1475,9 +1778,9 @@ export async function rpcRequest(
 
   ++sessionContext.revisions[inception];
   sessionContext.declarations.pop();
-  sessionContext.syncState.virtualParameterDeclarations.pop();
+  syncState.virtualParameterDeclarations.pop();
 
-  const ret = sessionContext.provisionsRet.splice(inception)[0];
+  const ret = sessionContext.provisionsRet?.splice(inception)[0];
   if (!ret) return rpcRequest(sessionContext, null);
 
   sessionContext.revisions.pop();
@@ -1499,12 +1802,15 @@ export async function rpcRequest(
   const timestamp = sessionContext.timestamp + sessionContext.iteration;
   let toClear;
   for (const [i, vpu] of ret.entries()) {
-    for (const [k, v] of Object.entries(vpu))
-      vpu[k] = [timestamp + (vparams[i][2][k] != null ? 1 : 0), v];
+    for (const [k, v] of Object.entries(vpu) as [keyof AttributeValues, any][])
+      vpu[k] = [
+        timestamp + ((vparams[i][2] as AttributeValues)[k] != null ? 1 : 0),
+        v,
+      ];
 
     toClear = device.set(
       sessionContext.deviceData,
-      Path.parse(`VirtualParameters.${vparams[i][0]}`),
+      `VirtualParameters.${vparams[i][0]}`,
       timestamp,
       vpu,
       toClear,
@@ -1521,13 +1827,13 @@ export async function rpcRequest(
 
 function generateGetRpcRequest(
   sessionContext: SessionContext,
-): GetParameterNames | GetParameterValues | GetParameterAttributes {
+): GetParameterNames | GetParameterValues | GetParameterAttributes | null {
   const syncState = sessionContext.syncState;
   if (!syncState) return null;
 
   for (const path of syncState.refreshAttributes.exist) {
     let found = false;
-    for (const p of sessionContext.deviceData.paths.find(
+    for (const p of sessionContext.deviceData.paths.findCompat(
       path,
       false,
       true,
@@ -1547,17 +1853,19 @@ function generateGetRpcRequest(
     }
 
     if (!found) {
-      const p = sessionContext.deviceData.paths.add(path.slice(0, -1));
+      const p = sessionContext.deviceData.paths.add(
+        path.slice(0, -1).toString(),
+      );
       syncState.gpn.add(p);
       const f = 1 << p.length;
-      syncState.gpnPatterns.set(p, f | syncState.gpnPatterns.get(p));
+      syncState.gpnPatterns.set(p, f | (syncState.gpnPatterns.get(p) ?? 0));
     }
   }
   syncState.refreshAttributes.exist.clear();
 
   for (const path of syncState.refreshAttributes.object) {
     let found = false;
-    for (const p of sessionContext.deviceData.paths.find(
+    for (const p of sessionContext.deviceData.paths.findCompat(
       path,
       false,
       true,
@@ -1577,19 +1885,21 @@ function generateGetRpcRequest(
     }
 
     if (!found) {
-      const p = sessionContext.deviceData.paths.add(path.slice(0, -1));
+      const p = sessionContext.deviceData.paths.add(
+        path.slice(0, -1).toString(),
+      );
       syncState.gpn.add(p);
       const f = 1 << p.length;
-      syncState.gpnPatterns.set(p, f | syncState.gpnPatterns.get(p));
+      syncState.gpnPatterns.set(p, f | (syncState.gpnPatterns.get(p) ?? 0));
     }
   }
   syncState.refreshAttributes.object.clear();
 
   for (const path of syncState.refreshAttributes.writable) {
-    const p = sessionContext.deviceData.paths.add(path.slice(0, -1));
+    const p = sessionContext.deviceData.paths.add(path.slice(0, -1).toString());
     syncState.gpn.add(p);
     const f = 1 << p.length;
-    syncState.gpnPatterns.set(p, f | syncState.gpnPatterns.get(p));
+    syncState.gpnPatterns.set(p, f | (syncState.gpnPatterns.get(p) ?? 0));
   }
   syncState.refreshAttributes.writable.clear();
 
@@ -1597,8 +1907,7 @@ function generateGetRpcRequest(
     const GPN_NEXT_LEVEL = localCache.getConfig(
       sessionContext.cacheSnapshot,
       "cwmp.gpnNextLevel",
-      {},
-      sessionContext.timestamp,
+      0,
       (e) => configContextCallback(sessionContext, e),
     ) as number;
 
@@ -1609,11 +1918,10 @@ function generateGetRpcRequest(
 
     // Skip root GPN workaround
     if (path && !path.length) {
-      const SKIP_ROOT_GPN = !!localCache.getConfig(
+      const SKIP_ROOT_GPN = localCache.getConfig(
         sessionContext.cacheSnapshot,
         "cwmp.skipRootGpn",
-        {},
-        sessionContext.timestamp,
+        false,
         (e) => configContextCallback(sessionContext, e),
       );
 
@@ -1634,7 +1942,7 @@ function generateGetRpcRequest(
       let est = 0;
       if (path.length >= GPN_NEXT_LEVEL) {
         const patterns: [Path, number][] = [[path, 0]];
-        for (const p of sessionContext.deviceData.paths.find(
+        for (const p of sessionContext.deviceData.paths.findCompat(
           path,
           true,
           false,
@@ -1651,7 +1959,7 @@ function generateGetRpcRequest(
         syncState.gpn.delete(path);
       } else {
         nextLevel = false;
-        for (const p of sessionContext.deviceData.paths.find(
+        for (const p of sessionContext.deviceData.paths.findCompat(
           path,
           false,
           true,
@@ -1672,8 +1980,7 @@ function generateGetRpcRequest(
     const GPV_BATCH_SIZE = localCache.getConfig(
       sessionContext.cacheSnapshot,
       "cwmp.gpvBatchSize",
-      {},
-      sessionContext.timestamp,
+      32,
       (e) => configContextCallback(sessionContext, e),
     ) as number;
 
@@ -1703,8 +2010,7 @@ function generateGetRpcRequest(
     const GPV_BATCH_SIZE = localCache.getConfig(
       sessionContext.cacheSnapshot,
       "cwmp.gpvBatchSize",
-      {},
-      sessionContext.timestamp,
+      32,
       (e) => configContextCallback(sessionContext, e),
     ) as number;
 
@@ -1750,30 +2056,32 @@ function compareAccessLists(list1: string[], list2: string[]): boolean {
 
 function generateSetRpcRequest(
   sessionContext: SessionContext,
-): (
-  | SetParameterValues
-  | SetParameterAttributes
-  | AddObject
-  | DeleteObject
-  | FactoryReset
-  | Reboot
-  | Download
-) & { next?: string } {
+):
+  | ((
+      | SetParameterValues
+      | SetParameterAttributes
+      | AddObject
+      | DeleteObject
+      | FactoryReset
+      | Reboot
+      | Download
+      | Upload
+    ) & { next?: string })
+  | null {
   const syncState = sessionContext.syncState;
   if (!syncState) return null;
 
   const deviceData = sessionContext.deviceData;
 
-  const SKIP_WRITABLE_CHECK = !!localCache.getConfig(
+  const SKIP_WRITABLE_CHECK = localCache.getConfig(
     sessionContext.cacheSnapshot,
     "cwmp.skipWritableCheck",
-    {},
-    sessionContext.timestamp,
+    false,
     (e) => configContextCallback(sessionContext, e),
   );
 
   const canWrite = (attrs: Attributes): boolean =>
-    SKIP_WRITABLE_CHECK || (attrs.writable && !!attrs.writable[1]);
+    !!SKIP_WRITABLE_CHECK || (!!attrs.writable && !!attrs.writable[1]);
 
   // Delete instance
   for (const instances of syncState.instancesToDelete.values()) {
@@ -1810,24 +2118,21 @@ function generateSetRpcRequest(
   const GPV_BATCH_SIZE = localCache.getConfig(
     sessionContext.cacheSnapshot,
     "cwmp.gpvBatchSize",
-    {},
-    sessionContext.timestamp,
+    32,
     (e) => configContextCallback(sessionContext, e),
   ) as number;
 
-  const DATETIME_MILLISECONDS = !!localCache.getConfig(
+  const DATETIME_MILLISECONDS = localCache.getConfig(
     sessionContext.cacheSnapshot,
     "cwmp.datetimeMilliseconds",
-    {},
-    sessionContext.timestamp,
+    true,
     (e) => configContextCallback(sessionContext, e),
   );
 
-  const BOOLEAN_LITERAL = !!localCache.getConfig(
+  const BOOLEAN_LITERAL = localCache.getConfig(
     sessionContext.cacheSnapshot,
     "cwmp.booleanLiteral",
-    {},
-    sessionContext.timestamp,
+    true,
     (e) => configContextCallback(sessionContext, e),
   );
 
@@ -1835,6 +2140,7 @@ function generateSetRpcRequest(
   for (const [k, v] of syncState.spv) {
     syncState.spv.delete(k);
     const attrs = sessionContext.deviceData.attributes.get(k);
+    if (!attrs) continue;
     const curVal = attrs.value?.[1];
     if (curVal && canWrite(attrs)) {
       const val = v.slice() as [string | number | boolean, string];
@@ -1866,10 +2172,11 @@ function generateSetRpcRequest(
   }
 
   // Set attributes
-  const parameterAttributes: [string, number, string[]][] = [];
+  const parameterAttributes: [string, number | null, string[] | null][] = [];
   for (const [k, v] of syncState.spa) {
     syncState.spa.delete(k);
     const attrs = sessionContext.deviceData.attributes.get(k);
+    if (!attrs) continue;
 
     if (
       v.notification != null &&
@@ -1903,17 +2210,19 @@ function generateSetRpcRequest(
     const attrs = deviceData.attributes.get(p);
     const t2 = attrs?.value?.[1]?.[0] as number;
     if (!(t <= t2)) {
-      const fileTypeAttrs = deviceData.attributes.get(
-        deviceData.paths.get(p.slice(0, -1).concat(Path.parse("FileType"))),
-      );
-      const fileNameAttrs = deviceData.attributes.get(
-        deviceData.paths.get(p.slice(0, -1).concat(Path.parse("FileName"))),
-      );
-      const targetFileNameAttrs = deviceData.attributes.get(
-        deviceData.paths.get(
-          p.slice(0, -1).concat(Path.parse("TargetFileName")),
-        ),
-      );
+      const base = p.slice(0, -1).toString();
+      const fileTypePath = deviceData.paths.get(`${base}.FileType`);
+      const fileNamePath = deviceData.paths.get(`${base}.FileName`);
+      const targetFileNamePath = deviceData.paths.get(`${base}.TargetFileName`);
+      const fileTypeAttrs = fileTypePath
+        ? deviceData.attributes.get(fileTypePath)
+        : undefined;
+      const fileNameAttrs = fileNamePath
+        ? deviceData.attributes.get(fileNamePath)
+        : undefined;
+      const targetFileNameAttrs = targetFileNamePath
+        ? deviceData.attributes.get(targetFileNamePath)
+        : undefined;
 
       return {
         name: "Download",
@@ -1926,13 +2235,44 @@ function generateSetRpcRequest(
     }
   }
 
+  // Uploads
+  for (const [p, t] of syncState.uploadsUpload) {
+    if (!(t > 0 && t <= sessionContext.timestamp)) continue;
+    const attrs = deviceData.attributes.get(p);
+    const t2 = attrs?.value?.[1]?.[0] as number;
+    if (!(t <= t2)) {
+      const base = p.slice(0, -1).toString();
+      const fileTypePath = deviceData.paths.get(`${base}.FileType`);
+      const fileNamePath = deviceData.paths.get(`${base}.FileName`);
+      const fileTypeAttrs = fileTypePath
+        ? deviceData.attributes.get(fileTypePath)
+        : undefined;
+      const fileNameAttrs = fileNamePath
+        ? deviceData.attributes.get(fileNamePath)
+        : undefined;
+      return {
+        name: "Upload",
+        commandKey: generateRpcId(sessionContext),
+        instance: p.segments[1] as string,
+        fileType: fileTypeAttrs?.value?.[1][0] as string,
+        fileName:
+          sessionContext.deviceId +
+          "/" +
+          (fileNameAttrs?.value?.[1][0] as string),
+        // Defer upload past session end; the fs PUT gate rejects
+        // same-session uploads as operations are persisted at endSession
+        delaySeconds: 1,
+      };
+    }
+  }
+
   // Reboot
   if (syncState.reboot > 0 && syncState.reboot <= sessionContext.timestamp) {
-    const p = sessionContext.deviceData.paths.get(Path.parse("Reboot"));
+    const p = sessionContext.deviceData.paths.get("Reboot");
     const attrs = p ? sessionContext.deviceData.attributes.get(p) : null;
     const t = attrs?.value?.[1][0] as number;
     if (!(t >= syncState.reboot)) {
-      delete syncState.reboot;
+      syncState.reboot = 0;
       return { name: "Reboot" };
     }
   }
@@ -1942,11 +2282,11 @@ function generateSetRpcRequest(
     syncState.factoryReset > 0 &&
     syncState.factoryReset <= sessionContext.timestamp
   ) {
-    const p = sessionContext.deviceData.paths.get(Path.parse("FactoryReset"));
+    const p = sessionContext.deviceData.paths.get("FactoryReset");
     const attrs = p ? sessionContext.deviceData.attributes.get(p) : null;
     const t = attrs?.value?.[1][0] as number;
     if (!(t >= syncState.factoryReset)) {
-      delete syncState.factoryReset;
+      syncState.factoryReset = 0;
       return { name: "FactoryReset" };
     }
   }
@@ -1957,37 +2297,51 @@ function generateSetRpcRequest(
 function generateGetVirtualParameterProvisions(
   sessionContext: SessionContext,
   virtualParameterDeclarations: VirtualParameterDeclaration[],
-): [
-  string,
-  AttributeTimestamps,
-  AttributeValues,
-  AttributeTimestamps,
-  AttributeValues,
-][] {
-  let provisions;
+):
+  | [
+      string,
+      AttributeTimestamps,
+      AttributeValues,
+      AttributeTimestamps,
+      AttributeValues,
+    ][]
+  | null {
+  let provisions:
+    | [
+        string,
+        AttributeTimestamps,
+        AttributeValues,
+        AttributeTimestamps,
+        AttributeValues,
+      ][]
+    | null = null;
   if (virtualParameterDeclarations) {
     for (const declaration of virtualParameterDeclarations) {
       if (declaration[1]) {
-        const currentTimestamps = {};
-        const currentValues = {};
-        const dec = {};
+        const currentTimestamps: AttributeTimestamps = {};
+        const currentValues: AttributeValues = {};
+        const dec: AttributeTimestamps = {};
         const attrs =
           sessionContext.deviceData.attributes.get(declaration[0]) || {};
 
         for (const [k, v] of Object.entries(declaration[1])) {
           if (k !== "value" && k !== "writable") continue;
-          if (!attrs[k] || v > attrs[k][0]) dec[k] = v;
+          const attr = attrs[k as "value" | "writable"];
+          if (!attr || v > attr[0]) dec[k] = v;
         }
 
-        for (const [k, v] of Object.entries(attrs)) {
+        for (const [k, v] of Object.entries(attrs) as [
+          keyof Attributes,
+          any,
+        ][]) {
           currentTimestamps[k] = v[0];
-          currentValues[k] = v[1];
+          (currentValues as Record<string, unknown>)[k] = v[1];
         }
 
         if (Object.keys(dec).length) {
           if (!provisions) provisions = [];
           provisions.push([
-            declaration[0].segments[1],
+            declaration[0].segments[1] as string,
             dec,
             {},
             currentTimestamps,
@@ -2003,14 +2357,24 @@ function generateGetVirtualParameterProvisions(
 function generateSetVirtualParameterProvisions(
   sessionContext: SessionContext,
   virtualParameterDeclarations: VirtualParameterDeclaration[],
-): [
-  string,
-  AttributeTimestamps,
-  AttributeValues,
-  AttributeTimestamps,
-  AttributeValues,
-][] {
-  let provisions;
+):
+  | [
+      string,
+      AttributeTimestamps,
+      AttributeValues,
+      AttributeTimestamps,
+      AttributeValues,
+    ][]
+  | null {
+  let provisions:
+    | [
+        string,
+        AttributeTimestamps,
+        AttributeValues,
+        AttributeTimestamps,
+        AttributeValues,
+      ][]
+    | null = null;
   if (virtualParameterDeclarations) {
     for (const declaration of virtualParameterDeclarations) {
       if (declaration[2]?.value != null) {
@@ -2032,15 +2396,18 @@ function generateSetVirtualParameterProvisions(
 
           if (val[0] !== attrs.value[1][0] || val[1] !== attrs.value[1][1]) {
             if (!provisions) provisions = [];
-            const currentTimestamps = {};
-            const currentValues = {};
-            for (const [k, v] of Object.entries(attrs)) {
+            const currentTimestamps: AttributeTimestamps = {};
+            const currentValues: AttributeValues = {};
+            for (const [k, v] of Object.entries(attrs) as [
+              keyof Attributes,
+              any,
+            ][]) {
               currentTimestamps[k] = v[0];
-              currentValues[k] = v[1];
+              (currentValues as Record<string, unknown>)[k] = v[1];
             }
 
             provisions.push([
-              declaration[0].segments[1],
+              declaration[0].segments[1] as string,
               {},
               { value: val },
               currentTimestamps,
@@ -2057,15 +2424,14 @@ function generateSetVirtualParameterProvisions(
 
 function processDeclarations(
   sessionContext: SessionContext,
-  allDeclareTimestamps,
+  allDeclareTimestamps: Map<Path, number>,
   allDeclareAttributeTimestamps: Map<Path, AttributeTimestamps>,
   allDeclareAttributeValues: Map<Path, AttributeValues>,
 ): VirtualParameterDeclaration[] {
   const deviceData = sessionContext.deviceData;
-  const syncState = sessionContext.syncState;
+  const syncState = ensureSyncState(sessionContext);
 
-  const root = sessionContext.deviceData.paths.add(Path.parse(""));
-  const paths = deviceData.paths.find(root, false, true, 99);
+  const paths = deviceData.paths.findCompat(Path.root, false, true, 99);
   paths.sort((a, b): number =>
     a.wildcard === b.wildcard ? a.length - b.length : a.wildcard - b.wildcard,
   );
@@ -2120,16 +2486,17 @@ function processDeclarations(
         const attrs = allDeclareAttributeTimestamps.get(path);
         if (attrs) {
           if (declareAttributeTimestamps) {
-            declareAttributeTimestamps = Object.assign(
+            const merged: AttributeTimestamps = Object.assign(
               {},
               declareAttributeTimestamps,
             );
-            for (const [k, v] of Object.entries(attrs)) {
-              declareAttributeTimestamps[k] = Math.max(
-                v,
-                declareAttributeTimestamps[k] || 0,
-              );
+            for (const [k, v] of Object.entries(attrs) as [
+              keyof AttributeTimestamps,
+              number,
+            ][]) {
+              merged[k] = Math.max(v, merged[k] || 0);
             }
+            declareAttributeTimestamps = merged;
           } else {
             declareAttributeTimestamps = attrs;
           }
@@ -2142,10 +2509,11 @@ function processDeclarations(
 
     if (currentAttributes) {
       leafParam = currentPath;
-      leafIsObject = currentAttributes.object?.[1];
+      const obj = currentAttributes.object;
+      leafIsObject = obj?.[1] ?? 0;
       // Possible V8 bug causes null === 0
-      if (leafIsObject != null && leafIsObject === 0)
-        leafTimestamp = Math.max(leafTimestamp, currentAttributes.object[0]);
+      if (obj && leafIsObject === 0)
+        leafTimestamp = Math.max(leafTimestamp, obj[0]);
     } else {
       leafTimestamp = Math.max(leafTimestamp, currentTimestamp);
     }
@@ -2158,13 +2526,17 @@ function processDeclarations(
       case "Reboot":
         if (currentPath.length === 1) {
           if (declareAttributeValues?.value)
-            syncState.reboot = +new Date(declareAttributeValues.value[0]);
+            syncState.reboot = +new Date(
+              declareAttributeValues.value[0] as string | number,
+            );
         }
         break;
       case "FactoryReset":
         if (currentPath.length === 1) {
           if (declareAttributeValues?.value)
-            syncState.factoryReset = +new Date(declareAttributeValues.value[0]);
+            syncState.factoryReset = +new Date(
+              declareAttributeValues.value[0] as string | number,
+            );
         }
         break;
       case "Tags":
@@ -2198,26 +2570,48 @@ function processDeclarations(
           if (currentPath.segments[2] === "Download") {
             syncState.downloadsDownload.set(
               currentPath,
-              declareAttributeValues.value[0],
+              declareAttributeValues.value[0] as number,
             );
           } else {
             syncState.downloadsValues.set(
               currentPath,
-              declareAttributeValues.value[0],
+              declareAttributeValues.value[0] as string | number,
+            );
+          }
+        }
+        break;
+
+      case "Uploads":
+        if (
+          currentPath.length === 3 &&
+          currentPath.wildcard === 0 &&
+          declareAttributeValues &&
+          declareAttributeValues.value
+        ) {
+          if (currentPath.segments[2] === "Upload") {
+            syncState.uploadsUpload.set(
+              currentPath,
+              declareAttributeValues.value[0] as number,
+            );
+          } else {
+            syncState.uploadsValues.set(
+              currentPath,
+              declareAttributeValues.value[0] as string | number,
             );
           }
         }
         break;
       case "VirtualParameters":
         if (currentPath.length <= 2) {
-          let d;
-          if (!(declareTimestamp <= currentTimestamp)) d = [currentPath];
+          let d: VirtualParameterDeclaration | undefined;
+          if (!(declareTimestamp <= currentTimestamp))
+            d = [currentPath] as unknown as VirtualParameterDeclaration;
 
           if (currentPath.wildcard === 0) {
             if (declareAttributeTimestamps) {
               for (const [attrName, attrTimestamp] of Object.entries(
                 declareAttributeTimestamps,
-              )) {
+              ) as [keyof Attributes, number][]) {
                 if (
                   !(
                     currentAttributes &&
@@ -2225,7 +2619,8 @@ function processDeclarations(
                     attrTimestamp <= currentAttributes[attrName][0]
                   )
                 ) {
-                  if (!d) d = [currentPath];
+                  if (!d)
+                    d = [currentPath] as unknown as VirtualParameterDeclaration;
                   if (!d[1]) d[1] = {};
                   d[1][attrName] = attrTimestamp;
                 }
@@ -2233,7 +2628,8 @@ function processDeclarations(
             }
 
             if (declareAttributeValues) {
-              if (!d) d = [currentPath];
+              if (!d)
+                d = [currentPath] as unknown as VirtualParameterDeclaration;
               d[2] = declareAttributeValues;
             }
           }
@@ -2254,14 +2650,14 @@ function processDeclarations(
               const f = 1 << leafParam.length;
               syncState.gpnPatterns.set(
                 leafParam,
-                f | syncState.gpnPatterns.get(leafParam),
+                f | (syncState.gpnPatterns.get(leafParam) ?? 0),
               );
             } else {
               const f =
                 ((1 << currentPath.length) - 1) ^ ((1 << leafParam.length) - 1);
               syncState.gpnPatterns.set(
                 currentPath,
-                f | syncState.gpnPatterns.get(currentPath),
+                f | (syncState.gpnPatterns.get(currentPath) ?? 0),
               );
             }
           } else {
@@ -2272,7 +2668,7 @@ function processDeclarations(
                 ((1 << leafParam.length) - 1);
               syncState.gpnPatterns.set(
                 currentPath,
-                f | syncState.gpnPatterns.get(currentPath),
+                f | (syncState.gpnPatterns.get(currentPath) ?? 0),
               );
             }
           }
@@ -2282,7 +2678,7 @@ function processDeclarations(
           if (declareAttributeTimestamps) {
             for (const [attrName, attrTimestamp] of Object.entries(
               declareAttributeTimestamps,
-            )) {
+            ) as [keyof Attributes, number][]) {
               if (
                 !(
                   currentAttributes[attrName] &&
@@ -2307,7 +2703,13 @@ function processDeclarations(
           }
           if (declareAttributeValues) {
             if (declareAttributeValues.value != null)
-              syncState.spv.set(currentPath, declareAttributeValues.value);
+              syncState.spv.set(
+                currentPath,
+                declareAttributeValues.value as [
+                  string | number | boolean,
+                  string,
+                ],
+              );
 
             if (declareAttributeValues.notification != null) {
               const spa = syncState.spa.get(currentPath);
@@ -2358,7 +2760,7 @@ function processDeclarations(
     allDeclareAttributeTimestamps.size ||
     allDeclareAttributeValues.size
   )
-    func(root, 1, 0, paths);
+    func(Path.root, 1, 0, [Path.root, ...paths]);
 
   return virtualParameterDeclarations;
 }
@@ -2372,24 +2774,32 @@ function processInstances(
   maxInstances: number,
   defer: boolean,
 ): void {
-  parent = sessionContext.deviceData.paths.add(parent);
-  let instancesToCreate: InstanceSet, instancesToDelete: Set<Path>;
+  parent = sessionContext.deviceData.paths.add(parent.toString());
+  const syncState = ensureSyncState(sessionContext);
+  let instancesToCreate: InstanceSet;
+  let instancesToDelete: Set<Path>;
   if (parent.segments[0] === "Downloads") {
     if (parent.length !== 1) return;
-    instancesToDelete = sessionContext.syncState.downloadsToDelete;
-    instancesToCreate = sessionContext.syncState.downloadsToCreate;
+    instancesToDelete = syncState.downloadsToDelete;
+    instancesToCreate = syncState.downloadsToCreate;
+  } else if (parent.segments[0] === "Uploads") {
+    if (parent.length !== 1) return;
+    instancesToDelete = syncState.uploadsToDelete;
+    instancesToCreate = syncState.uploadsToCreate;
   } else {
-    instancesToDelete = sessionContext.syncState.instancesToDelete.get(parent);
-    if (instancesToDelete == null) {
-      instancesToDelete = new Set();
-      sessionContext.syncState.instancesToDelete.set(parent, instancesToDelete);
+    let existingDelete = syncState.instancesToDelete.get(parent);
+    if (existingDelete == null) {
+      existingDelete = new Set();
+      syncState.instancesToDelete.set(parent, existingDelete);
     }
+    instancesToDelete = existingDelete;
 
-    instancesToCreate = sessionContext.syncState.instancesToCreate.get(parent);
-    if (instancesToCreate == null) {
-      instancesToCreate = new InstanceSet();
-      sessionContext.syncState.instancesToCreate.set(parent, instancesToCreate);
+    let existingCreate = syncState.instancesToCreate.get(parent);
+    if (existingCreate == null) {
+      existingCreate = new InstanceSet();
+      syncState.instancesToCreate.set(parent, existingCreate);
     }
+    instancesToCreate = existingCreate;
   }
 
   if (defer && instancesToCreate.size === 0 && instancesToDelete.size === 0)
@@ -2428,7 +2838,7 @@ export async function rpcResponse(
   sessionContext: SessionContext,
   id: string,
   _rpcRes: CpeResponse,
-): Promise<Fault> {
+): Promise<Fault | null> {
   function invalidResponse(message: string): Fault {
     return {
       code: "invalid_response",
@@ -2442,11 +2852,13 @@ export async function rpcResponse(
   ++sessionContext.rpcCount;
 
   const rpcRes = _rpcRes;
-  const rpcReq: typeof sessionContext.rpcRequest & { next?: string } =
-    sessionContext.rpcRequest;
+  const rpcReq = sessionContext.rpcRequest as
+    | (AcsRequest & { next?: string })
+    | undefined;
+  if (!rpcReq) return invalidResponse("No outstanding request");
 
   if (!rpcReq.next) {
-    sessionContext.rpcRequest = null;
+    sessionContext.rpcRequest = undefined;
   } else if (rpcReq.next === "getInstanceKeys") {
     const parameterNames = [];
     const instanceValues: Record<string, string> = {};
@@ -2459,7 +2871,7 @@ export async function rpcResponse(
     }
 
     if (!parameterNames.length) {
-      sessionContext.rpcRequest = null;
+      sessionContext.rpcRequest = undefined;
     } else {
       const r: GetParameterValues & {
         next: "setInstanceKeys";
@@ -2484,26 +2896,24 @@ export async function rpcResponse(
           req.instanceValues[p[0].toString()],
           p[2] as string,
         ]);
-        parameterList.push([p[0].toString(), v[0], v[1]]);
+        if (v[0] != null) parameterList.push([p[0].toString(), v[0], v[1]]);
       }
     }
 
     if (!parameterList.length) {
-      sessionContext.rpcRequest = null;
+      sessionContext.rpcRequest = undefined;
     } else {
-      const DATETIME_MILLISECONDS = !!localCache.getConfig(
+      const DATETIME_MILLISECONDS = localCache.getConfig(
         sessionContext.cacheSnapshot,
         "cwmp.datetimeMilliseconds",
-        {},
-        sessionContext.timestamp,
+        true,
         (e) => configContextCallback(sessionContext, e),
       );
 
-      const BOOLEAN_LITERAL = !!localCache.getConfig(
+      const BOOLEAN_LITERAL = localCache.getConfig(
         sessionContext.cacheSnapshot,
         "cwmp.booleanLiteral",
-        {},
-        sessionContext.timestamp,
+        true,
         (e) => configContextCallback(sessionContext, e),
       );
 
@@ -2524,7 +2934,7 @@ export async function rpcResponse(
   sessionContext.deviceData.timestamps.revision = revision;
   sessionContext.deviceData.attributes.revision = revision;
 
-  let toClear: Clear[];
+  let toClear: Clear[] | undefined;
 
   if (rpcRes.name === "GetParameterValuesResponse") {
     if (rpcReq.name !== "GetParameterValues")
@@ -2543,7 +2953,7 @@ export async function rpcResponse(
       }
       toClear = device.set(
         sessionContext.deviceData,
-        path,
+        path.toString(),
         timestamp,
         {
           object: [timestamp, 0],
@@ -2562,7 +2972,7 @@ export async function rpcResponse(
         });
         toClear = device.set(
           sessionContext.deviceData,
-          Path.parse(p),
+          p,
           timestamp,
           {
             object: [timestamp, 0],
@@ -2589,7 +2999,7 @@ export async function rpcResponse(
       }
       toClear = device.set(
         sessionContext.deviceData,
-        path,
+        path.toString(),
         timestamp,
         {
           notification: [timestamp, notification],
@@ -2608,7 +3018,7 @@ export async function rpcResponse(
         });
         toClear = device.set(
           sessionContext.deviceData,
-          Path.parse(p),
+          p,
           timestamp,
           {
             notification: [timestamp, 0],
@@ -2623,7 +3033,8 @@ export async function rpcResponse(
       return invalidResponse("Response name does not match request name");
 
     let root: Path;
-    if (rpcReq.parameterPath.endsWith("."))
+    if (!rpcReq.parameterPath) root = Path.root;
+    else if (rpcReq.parameterPath.endsWith("."))
       root = Path.parse(rpcReq.parameterPath.slice(0, -1));
     else root = Path.parse(rpcReq.parameterPath);
 
@@ -2666,8 +3077,9 @@ export async function rpcResponse(
         "FactoryReset",
         "VirtualParameters",
         "Downloads",
+        "Uploads",
       ]) {
-        const p = sessionContext.deviceData.paths.get(Path.parse(n));
+        const p = sessionContext.deviceData.paths.get(n);
         if (p && sessionContext.deviceData.attributes.has(p))
           sessionContext.deviceData.timestamps.set(p, timestamp);
       }
@@ -2693,7 +3105,7 @@ export async function rpcResponse(
 
       toClear = device.set(
         sessionContext.deviceData,
-        path,
+        path.toString(),
         timestamp,
         {
           object: [timestamp, object ? 1 : 0],
@@ -2706,9 +3118,9 @@ export async function rpcResponse(
     for (const path of wildcardParams) {
       toClear = device.set(
         sessionContext.deviceData,
-        path,
+        path.toString(),
         timestamp,
-        null,
+        undefined,
         toClear,
       );
     }
@@ -2719,7 +3131,7 @@ export async function rpcResponse(
     for (const p of rpcReq.parameterList) {
       toClear = device.set(
         sessionContext.deviceData,
-        Path.parse(p[0]),
+        p[0],
         timestamp + 1,
         {
           object: [timestamp + 1, 0],
@@ -2736,7 +3148,7 @@ export async function rpcResponse(
       return invalidResponse("Response name does not match request name");
 
     for (const p of rpcReq.parameterList) {
-      let attrs;
+      let attrs: Attributes | undefined;
 
       if (p[1] != null && p[2] != null) {
         attrs = {
@@ -2755,7 +3167,7 @@ export async function rpcResponse(
 
       toClear = device.set(
         sessionContext.deviceData,
-        Path.parse(p[0]),
+        p[0],
         timestamp + 1,
         attrs,
         toClear,
@@ -2767,7 +3179,7 @@ export async function rpcResponse(
 
     toClear = device.set(
       sessionContext.deviceData,
-      Path.parse(rpcReq.objectName + rpcRes.instanceNumber),
+      rpcReq.objectName + rpcRes.instanceNumber,
       timestamp + 1,
       { object: [timestamp + 1, 1] },
       toClear,
@@ -2778,9 +3190,9 @@ export async function rpcResponse(
 
     toClear = device.set(
       sessionContext.deviceData,
-      Path.parse(rpcReq.objectName.slice(0, -1)),
+      rpcReq.objectName.slice(0, -1),
       timestamp + 1,
-      null,
+      undefined,
       toClear,
     );
   } else if (rpcRes.name === "RebootResponse") {
@@ -2789,7 +3201,7 @@ export async function rpcResponse(
 
     toClear = device.set(
       sessionContext.deviceData,
-      Path.parse("Reboot"),
+      "Reboot",
       timestamp + 1,
       { value: [timestamp + 1, [sessionContext.timestamp, "xsd:dateTime"]] },
       toClear,
@@ -2800,7 +3212,7 @@ export async function rpcResponse(
 
     toClear = device.set(
       sessionContext.deviceData,
-      Path.parse("FactoryReset"),
+      "FactoryReset",
       timestamp + 1,
       { value: [timestamp + 1, [sessionContext.timestamp, "xsd:dateTime"]] },
       toClear,
@@ -2811,7 +3223,7 @@ export async function rpcResponse(
 
     toClear = device.set(
       sessionContext.deviceData,
-      Path.parse(`Downloads.${rpcReq.instance}.Download`),
+      `Downloads.${rpcReq.instance}.Download`,
       timestamp + 1,
       { value: [timestamp + 1, [sessionContext.timestamp, "xsd:dateTime"]] },
       toClear,
@@ -2820,7 +3232,7 @@ export async function rpcResponse(
     if (rpcRes.status === 0) {
       toClear = device.set(
         sessionContext.deviceData,
-        Path.parse(`Downloads.${rpcReq.instance}.LastDownload`),
+        `Downloads.${rpcReq.instance}.LastDownload`,
         timestamp + 1,
         {
           value: [timestamp + 1, [sessionContext.timestamp, "xsd:dateTime"]],
@@ -2830,7 +3242,7 @@ export async function rpcResponse(
 
       toClear = device.set(
         sessionContext.deviceData,
-        Path.parse(`Downloads.${rpcReq.instance}.LastFileType`),
+        `Downloads.${rpcReq.instance}.LastFileType`,
         timestamp + 1,
         { value: [timestamp + 1, [rpcReq.fileType, "xsd:string"]] },
         toClear,
@@ -2838,37 +3250,39 @@ export async function rpcResponse(
 
       toClear = device.set(
         sessionContext.deviceData,
-        Path.parse(`Downloads.${rpcReq.instance}.LastFileName`),
+        `Downloads.${rpcReq.instance}.LastFileName`,
         timestamp + 1,
-        { value: [timestamp + 1, [rpcReq.fileType, "xsd:string"]] },
+        { value: [timestamp + 1, [rpcReq.fileName ?? "", "xsd:string"]] },
         toClear,
       );
 
       toClear = device.set(
         sessionContext.deviceData,
-        Path.parse(`Downloads.${rpcReq.instance}.LastTargetFileName`),
+        `Downloads.${rpcReq.instance}.LastTargetFileName`,
         timestamp + 1,
-        { value: [timestamp + 1, [rpcReq.fileType, "xsd:string"]] },
+        { value: [timestamp + 1, [rpcReq.targetFileName ?? "", "xsd:string"]] },
         toClear,
       );
 
       toClear = device.set(
         sessionContext.deviceData,
-        Path.parse(`Downloads.${rpcReq.instance}.StartTime`),
+        `Downloads.${rpcReq.instance}.StartTime`,
         timestamp + 1,
-        { value: [timestamp + 1, [+rpcRes.startTime, "xsd:dateTime"]] },
+        { value: [timestamp + 1, [+(rpcRes.startTime ?? 0), "xsd:dateTime"]] },
         toClear,
       );
 
       toClear = device.set(
         sessionContext.deviceData,
-        Path.parse(`Downloads.${rpcReq.instance}.CompleteTime`),
+        `Downloads.${rpcReq.instance}.CompleteTime`,
         timestamp + 1,
-        { value: [timestamp + 1, [+rpcRes.completeTime, "xsd:dateTime"]] },
+        {
+          value: [timestamp + 1, [+(rpcRes.completeTime ?? 0), "xsd:dateTime"]],
+        },
         toClear,
       );
     } else {
-      const operation = {
+      const operation: Operation = {
         name: "Download",
         timestamp: sessionContext.timestamp,
         provisions: sessionContext.provisions,
@@ -2877,8 +3291,85 @@ export async function rpcResponse(
         args: {
           instance: rpcReq.instance,
           fileType: rpcReq.fileType,
-          fileName: rpcReq.fileName,
-          targetFileName: rpcReq.targetFileName,
+          fileName: rpcReq.fileName ?? "",
+          targetFileName: rpcReq.targetFileName ?? "",
+        },
+      };
+      for (const channel of Object.keys(sessionContext.channels)) {
+        if (sessionContext.retries[channel] != null)
+          operation.retries[channel] = sessionContext.retries[channel];
+      }
+
+      sessionContext.operations[rpcReq.commandKey] = operation;
+      sessionContext.operationsTouched[rpcReq.commandKey] = 1;
+    }
+  } else if (rpcRes.name === "UploadResponse") {
+    if (rpcReq.name !== "Upload")
+      return invalidResponse("Response name does not match request name");
+
+    toClear = device.set(
+      sessionContext.deviceData,
+      `Uploads.${rpcReq.instance}.Upload`,
+      timestamp + 1,
+      { value: [timestamp + 1, [sessionContext.timestamp, "xsd:dateTime"]] },
+      toClear,
+    );
+
+    if (rpcRes.status === 0) {
+      toClear = device.set(
+        sessionContext.deviceData,
+        `Uploads.${rpcReq.instance}.LastUpload`,
+        timestamp + 1,
+        {
+          value: [timestamp + 1, [sessionContext.timestamp, "xsd:dateTime"]],
+        },
+        toClear,
+      );
+
+      toClear = device.set(
+        sessionContext.deviceData,
+        `Uploads.${rpcReq.instance}.LastFileType`,
+        timestamp + 1,
+        { value: [timestamp + 1, [rpcReq.fileType, "xsd:string"]] },
+        toClear,
+      );
+
+      toClear = device.set(
+        sessionContext.deviceData,
+        `Uploads.${rpcReq.instance}.LastFileName`,
+        timestamp + 1,
+        { value: [timestamp + 1, [rpcReq.fileName ?? "", "xsd:string"]] },
+        toClear,
+      );
+
+      toClear = device.set(
+        sessionContext.deviceData,
+        `Uploads.${rpcReq.instance}.StartTime`,
+        timestamp + 1,
+        { value: [timestamp + 1, [+(rpcRes.startTime ?? 0), "xsd:dateTime"]] },
+        toClear,
+      );
+
+      toClear = device.set(
+        sessionContext.deviceData,
+        `Uploads.${rpcReq.instance}.CompleteTime`,
+        timestamp + 1,
+        {
+          value: [timestamp + 1, [+(rpcRes.completeTime ?? 0), "xsd:dateTime"]],
+        },
+        toClear,
+      );
+    } else {
+      const operation: Operation = {
+        name: "Upload",
+        timestamp: sessionContext.timestamp,
+        provisions: sessionContext.provisions,
+        channels: sessionContext.channels,
+        retries: {},
+        args: {
+          instance: rpcReq.instance,
+          fileType: rpcReq.fileType,
+          fileName: rpcReq.fileName ?? "",
         },
       };
 
@@ -2888,8 +3379,6 @@ export async function rpcResponse(
       }
 
       sessionContext.operations[rpcReq.commandKey] = operation;
-      if (!sessionContext.operationsTouched)
-        sessionContext.operationsTouched = {};
       sessionContext.operationsTouched[rpcReq.commandKey] = 1;
     }
   } else {
@@ -2908,21 +3397,21 @@ export async function rpcFault(
   sessionContext: SessionContext,
   id: string,
   faultResponse: CpeFault,
-): Promise<Fault> {
+): Promise<Fault | null> {
   const rpcReq = sessionContext.rpcRequest;
   delete sessionContext.syncState;
   delete sessionContext.rpcRequest;
   ++sessionContext.rpcCount;
 
   // Recover from invalid parameter name faults
-  if (faultResponse.detail.faultCode === "9005") {
+  if (rpcReq && faultResponse.detail?.faultCode === "9005") {
     const timestamp = sessionContext.timestamp + sessionContext.iteration + 1;
     const revision =
       (sessionContext.revisions[sessionContext.revisions.length - 1] || 0) + 1;
     sessionContext.deviceData.timestamps.revision = revision;
     sessionContext.deviceData.attributes.revision = revision;
 
-    let toClear: Clear[];
+    let toClear: Clear[] | undefined;
     if (rpcReq.name === "GetParameterNames") {
       if (rpcReq.parameterPath) {
         toClear = [
@@ -2946,9 +3435,9 @@ export async function rpcFault(
         (p) => [Path.parse(p.replace(/\.$/, "")), timestamp] as Clear,
       );
     } else if (rpcReq.name === "SetParameterAttributes") {
-      toClear = (rpcReq.parameterList as [string, number, string[]][]).map(
-        (p) => [Path.parse(p[0].replace(/\.$/, "")), timestamp] as Clear,
-      );
+      toClear = (
+        rpcReq.parameterList as [string, number | null, string[] | null][]
+      ).map((p) => [Path.parse(p[0].replace(/\.$/, "")), timestamp] as Clear);
     }
 
     if (toClear) {
@@ -2959,8 +3448,8 @@ export async function rpcFault(
   }
 
   const fault: Fault = {
-    code: `cwmp.${faultResponse.detail.faultCode}`,
-    message: faultResponse.detail.faultString,
+    code: `cwmp.${faultResponse.detail?.faultCode ?? ""}`,
+    message: faultResponse.detail?.faultString ?? "",
     detail: faultResponse.detail,
   };
 
@@ -2977,7 +3466,7 @@ export async function deserialize(
 
   const deviceData = initDeviceData();
   for (const r of sessionContext.deviceData as unknown as any[]) {
-    const path = deviceData.paths.add(Path.parse(r[0]));
+    const path = deviceData.paths.add(r[0]);
 
     if (r[1]) deviceData.trackers.set(path, r[1]);
 
@@ -2999,8 +3488,8 @@ export async function serialize(
 ): Promise<string> {
   const deviceData = [];
 
-  for (const path of sessionContext.deviceData.paths.find(
-    Path.parse(""),
+  for (const path of sessionContext.deviceData.paths.findCompat(
+    Path.root,
     false,
     false,
     99,

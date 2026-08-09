@@ -1,20 +1,20 @@
 import { Script } from "node:vm";
 import { Readable } from "node:stream";
-import { Collection, ObjectId, WithoutId } from "mongodb";
-import { encodeTag } from "../util.ts";
-import { evaluate } from "../common/expression/util.ts";
-import { Expression, Fault, Task } from "../types.ts";
-import { collections, filesBucket } from "../db/db.ts";
+import { ObjectId, WithoutId } from "mongodb";
+import { encodeTag, escapeRegExp } from "../util.ts";
+import { Fault, SessionFault, Task } from "../types.ts";
+import { collections, filesBucket, uploadsBucket } from "../db/db.ts";
+import { validateViewScript } from "../bundle-views.ts";
 import { convertOldPrecondition, optimizeProjection } from "../db/util.ts";
 import * as MongoTypes from "../db/types.ts";
-import { parse, parseList, stringify } from "../common/expression/parser.ts";
+import Expression, { parseList, Value } from "../common/expression.ts";
 import { toMongoQuery } from "../db/synth.ts";
 
 function processDeviceProjection(
   projection: Record<string, 1>,
 ): Record<string, 1> {
   if (!projection) return projection;
-  const p = {};
+  const p: Record<string, 1> = {};
   for (const [k, v] of Object.entries(projection)) {
     if (k === "DeviceID.ID") {
       p["_id"] = 1;
@@ -42,7 +42,7 @@ function processDeviceSort(
   sort: Record<string, number>,
 ): Record<string, number> {
   if (!sort) return sort;
-  const s = {};
+  const s: Record<string, number> = {};
   for (const [k, v] of Object.entries(sort)) {
     if (k === "DeviceID.ID") s["_id"] = v;
     else if (k.startsWith("DeviceID.")) s[`_deviceId._${k.slice(9)}`] = v;
@@ -61,127 +61,53 @@ function parseDate(d: Date): number | string {
   return isNaN(n) ? "" + d : n;
 }
 
-interface FlatAttributes {
-  object?: boolean;
-  objectTimestamp?: number;
-  writable?: boolean;
-  writableTimestamp?: number;
-  value?: [string | number | boolean, string];
-  valueTimestamp?: number;
-  notification?: number;
-  notificationTimestamp?: number;
-  accessList?: string[];
-  accessListTimestamp?: number;
-}
-
 export interface FlatDevice {
-  [param: string]: FlatAttributes;
+  [param: string]: Value;
 }
 
 export function flattenDevice(device: Record<string, unknown>): FlatDevice {
   function recursive(
-    input,
+    input: Record<string, unknown>,
     root: string,
     output: FlatDevice,
     timestamp: number,
   ): void {
-    for (const [name, tree] of Object.entries(input)) {
+    for (const [name, treeRaw] of Object.entries(input)) {
+      const tree = treeRaw as Record<string, any>;
       if (!root) {
         if (name === "_lastInform") {
-          output["Events.Inform"] = {
-            value: [parseDate(tree as Date), "xsd:dateTime"],
-            valueTimestamp: timestamp,
-            writable: false,
-            writableTimestamp: timestamp,
-            object: false,
-            objectTimestamp: timestamp,
-          };
+          output["Events.Inform"] = parseDate(treeRaw as Date);
+          output["Events.Inform:type"] = "xsd:dateTime";
         } else if (name === "_registered") {
-          output["Events.Registered"] = {
-            value: [parseDate(tree as Date), "xsd:dateTime"],
-            valueTimestamp: timestamp,
-            writable: false,
-            writableTimestamp: timestamp,
-            object: false,
-            objectTimestamp: timestamp,
-          };
+          output["Events.Registered"] = parseDate(treeRaw as Date);
+          output["Events.Registered:type"] = "xsd:dateTime";
         } else if (name === "_lastBoot") {
-          output["Events.1_BOOT"] = {
-            value: [parseDate(tree as Date), "xsd:dateTime"],
-            valueTimestamp: timestamp,
-            writable: false,
-            writableTimestamp: timestamp,
-            object: false,
-            objectTimestamp: timestamp,
-          };
+          output["Events.1_BOOT"] = parseDate(treeRaw as Date);
+          output["Events.1_BOOT:type"] = "xsd:dateTime";
         } else if (name === "_lastBootstrap") {
-          output["Events.0_BOOTSTRAP"] = {
-            value: [parseDate(tree as Date), "xsd:dateTime"],
-            valueTimestamp: timestamp,
-            writable: false,
-            writableTimestamp: timestamp,
-            object: false,
-            objectTimestamp: timestamp,
-          };
+          output["Events.0_BOOTSTRAP"] = parseDate(treeRaw as Date);
+          output["Events.0_BOOTSTRAP:type"] = "xsd:dateTime";
         } else if (name === "_id") {
-          output["DeviceID.ID"] = {
-            value: [tree as string, "xsd:string"],
-            valueTimestamp: timestamp,
-            writable: false,
-            writableTimestamp: timestamp,
-            object: false,
-            objectTimestamp: timestamp,
-          };
+          output["DeviceID.ID"] = treeRaw as string;
+          output["DeviceID.ID:type"] = "xsd:dateTime";
         } else if (name === "_deviceId") {
-          output["DeviceID.Manufacturer"] = {
-            value: [tree["_Manufacturer"], "xsd:string"],
-            valueTimestamp: timestamp,
-            writable: false,
-            writableTimestamp: timestamp,
-            object: false,
-            objectTimestamp: timestamp,
-          };
-          output["DeviceID.OUI"] = {
-            value: [tree["_OUI"], "xsd:string"],
-            valueTimestamp: timestamp,
-            writable: false,
-            writableTimestamp: timestamp,
-            object: false,
-            objectTimestamp: timestamp,
-          };
-          output["DeviceID.ProductClass"] = {
-            value: [tree["_ProductClass"], "xsd:string"],
-            valueTimestamp: timestamp,
-            writable: false,
-            writableTimestamp: timestamp,
-            object: false,
-            objectTimestamp: timestamp,
-          };
-          output["DeviceID.SerialNumber"] = {
-            value: [tree["_SerialNumber"], "xsd:string"],
-            valueTimestamp: timestamp,
-            writable: false,
-            writableTimestamp: timestamp,
-            object: false,
-            objectTimestamp: timestamp,
-          };
+          output["DeviceID.Manufacturer"] = tree["_Manufacturer"];
+          output["DeviceID.Manufacturer:type"] = "xsd:string";
+          output["DeviceID.OUI"] = tree["_OUI"];
+          output["DeviceID.OUI:type"] = "xsd:string";
+          output["DeviceID.ProductClass"] = tree["_ProductClass"];
+          output["DeviceID.ProductClass:type"] = "xsd:string";
+          output["DeviceID.SerialNumber"] = tree["_SerialNumber"];
+          output["DeviceID.SerialNumber:type"] = "xsd:string";
         } else if (name === "_tags") {
-          output["Tags"] = {
-            writable: false,
-            writableTimestamp: timestamp,
-            object: true,
-            objectTimestamp: timestamp,
-          };
+          output["Tags:object"] = true;
+          output["Tags:writable"] = true;
 
-          for (const t of tree as string[]) {
-            output[`Tags.${encodeTag(t)}`] = {
-              value: [true, "xsd:boolean"],
-              valueTimestamp: timestamp,
-              writable: true,
-              writableTimestamp: timestamp,
-              object: false,
-              objectTimestamp: timestamp,
-            };
+          for (const t of treeRaw as string[]) {
+            const et = encodeTag(t);
+            output[`Tags.${et}`] = true;
+            output[`Tags.${et}:type`] = "xsd:boolean";
+            output[`Tags.${et}:writable`] = true;
           }
         }
       }
@@ -190,44 +116,41 @@ export function flattenDevice(device: Record<string, unknown>): FlatDevice {
 
       let childrenTimestamp = timestamp;
 
-      if (!root) childrenTimestamp = +(input["_timestamp"] || 1);
-      else if (+input["_timestamp"] > timestamp)
-        childrenTimestamp = +input["_timestamp"];
+      if (!root) childrenTimestamp = +((input["_timestamp"] as number) || 1);
+      else if (+(input["_timestamp"] as number) > timestamp)
+        childrenTimestamp = +(input["_timestamp"] as number);
 
-      const attrs: FlatAttributes = {};
+      const r = root ? `${root}.${name}` : name;
+
       if (tree["_value"] != null) {
-        attrs.value = [
-          tree["_value"] instanceof Date ? +tree["_value"] : tree["_value"],
-          tree["_type"],
-        ];
-        attrs.valueTimestamp = +(tree["_timestamp"] || childrenTimestamp);
-        attrs.object = false;
-        attrs.objectTimestamp = childrenTimestamp;
+        output[r] =
+          tree["_value"] instanceof Date ? +tree["_value"] : tree["_value"];
+        output[`${r}:type`] = tree["_type"];
+        output[`${r}:timestamp`] = childrenTimestamp;
+        output[`${r}:valueTimestamp`] = +(
+          tree["_timestamp"] || childrenTimestamp
+        );
       } else if (tree["_object"] != null) {
-        attrs.object = tree["_object"];
-        attrs.objectTimestamp = childrenTimestamp;
+        output[`${r}:object`] = tree["_object"];
+        output[`${r}:timestamp`] = childrenTimestamp;
       }
 
       if (tree["_writable"] != null) {
-        attrs.writable = tree["_writable"];
-        attrs.writableTimestamp = childrenTimestamp;
+        output[`${r}:writable`] = tree["_writable"];
+        output[`${r}:timestamp`] = childrenTimestamp;
       }
 
       if (tree["_notification"] != null) {
-        attrs.notification = tree["_notification"];
-        attrs.notificationTimestamp = +tree["_attributesTimestamp"] || 1;
+        output[`${r}:notification`] = tree["_notification"];
+        output[`${r}:attributesTimestamp`] = +tree["_attributesTimestamp"] || 1;
       }
 
       if (tree["_accessList"] != null) {
-        attrs.accessList = tree["_accessList"];
-        attrs.accessListTimestamp = +tree["_attributesTimestamp"] || 1;
+        output[`${r}:accessList`] = tree["_accessList"].join(",");
+        output[`${r}:attributesTimestamp`] = +tree["_attributesTimestamp"] || 1;
       }
 
-      const r = root ? `${root}.${name}` : name;
-      output[r] = attrs;
-
-      if (attrs.object || tree["object"] == null)
-        recursive(tree, r, output, childrenTimestamp);
+      recursive(tree, r, output, childrenTimestamp);
     }
   }
 
@@ -238,16 +161,19 @@ export function flattenDevice(device: Record<string, unknown>): FlatDevice {
 }
 
 function flattenFault(fault: unknown): Fault {
-  const f = Object.assign({}, fault) as Fault;
+  const f = Object.assign({}, fault) as SessionFault;
   if (f.timestamp) f.timestamp = +f.timestamp;
-  if (f["expiry"]) f["expiry"] = +f["expiry"];
-  return f as Fault;
+  if (f.expiry) f.expiry = +f.expiry;
+  return f;
 }
 
 function flattenTask(task: unknown): Task {
-  const t = Object.assign({}, task) as Task;
+  const t = Object.assign({}, task) as Task & {
+    timestamp?: number;
+    expiry?: number;
+  };
   t._id = "" + t._id;
-  if (t["timestamp"]) t["timestamp"] = +t["timestamp"];
+  if (t.timestamp) t.timestamp = +t.timestamp;
   if (t.expiry) t.expiry = +t.expiry;
   return t;
 }
@@ -259,14 +185,12 @@ function flattenPreset(
   if (p.precondition) {
     try {
       // Try parse to check expression validity
-      parse(p.precondition as string);
-    } catch (error) {
-      p.precondition = convertOldPrecondition(
-        JSON.parse(p.precondition as string),
-      );
-      p.precondition = (p.precondition as string).length
-        ? stringify(p.precondition as Expression)
-        : "";
+      Expression.parse(p.precondition as string);
+    } catch {
+      const e = convertOldPrecondition(JSON.parse(p.precondition as string));
+      if (e instanceof Expression.Literal && e.value)
+        p.precondition = e.toString();
+      else p.precondition = "";
     }
   }
 
@@ -276,16 +200,21 @@ function flattenPreset(
     p.events = e.join(", ");
   }
 
-  const provision = p.configurations[0];
+  const configurations = p.configurations as {
+    type: string;
+    name?: string;
+    args?: unknown[];
+  }[];
+  const provision = configurations?.[0];
   if (
-    (p.configurations as any[]).length === 1 &&
+    configurations?.length === 1 &&
     provision.type === "provision" &&
     provision.name &&
     provision.name.length
   ) {
     p.provision = provision.name;
     p.provisionArgs = provision.args
-      ? provision.args.map((a) => stringify(a)).join(", ")
+      ? provision.args.map((a: unknown) => String(a)).join(", ")
       : "";
   }
 
@@ -294,14 +223,21 @@ function flattenPreset(
 }
 
 function flattenFile(file: Record<string, unknown>): Record<string, unknown> {
-  const f = {};
+  const f: Record<string, unknown> = {};
   f["_id"] = file["_id"];
-  if (file.metadata) {
-    f["metadata.fileType"] = file["metadata"]["fileType"] || "";
-    f["metadata.oui"] = file["metadata"]["oui"] || "";
-    f["metadata.productClass"] = file["metadata"]["productClass"] || "";
-    f["metadata.version"] = file["metadata"]["version"] || "";
+  const metadata = file.metadata as Record<string, unknown> | undefined;
+  if (metadata) {
+    f["metadata.fileType"] = metadata["fileType"] || "";
+    f["metadata.oui"] = metadata["oui"] || "";
+    f["metadata.productClass"] = metadata["productClass"] || "";
+    f["metadata.version"] = metadata["version"] || "";
   }
+  return f;
+}
+
+function flattenUpload(file: Record<string, unknown>): Record<string, unknown> {
+  const f: Record<string, unknown> = {};
+  f["_id"] = file["_id"];
   return f;
 }
 
@@ -309,12 +245,11 @@ function preProcessPreset(data: Record<string, unknown>): MongoTypes.Preset {
   const preset = Object.assign({}, data);
 
   if (!preset.precondition) preset.precondition = "";
-  // Try parse to check expression validity
-  parse(preset.precondition as string);
+  else Expression.parse(preset.precondition as string); // Try parse to check validity
 
   preset.weight = parseInt(preset.weight as string) || 0;
 
-  const events = {};
+  const events: Record<string, boolean> = {};
   if (preset.events) {
     for (let e of (preset.events as string).split(",")) {
       let v = true;
@@ -334,7 +269,7 @@ function preProcessPreset(data: Record<string, unknown>): MongoTypes.Preset {
   const configuration = {
     type: "provision",
     name: preset.provision,
-    args: null,
+    args: null as Expression[] | null,
   };
 
   if (preset.provisionArgs)
@@ -361,11 +296,17 @@ export async function* query(
   options?: QueryOptions,
 ): AsyncGenerator<any, void, undefined> {
   options = options || {};
-  filter = evaluate(filter, null, Date.now());
+  const now = Date.now();
+  filter = filter.evaluate((e) => {
+    if (e instanceof Expression.FunctionCall) {
+      if (e.name === "NOW") return new Expression.Literal(now);
+    }
+    return e;
+  });
   const q = toMongoQuery(filter, resource);
   if (!q) return;
 
-  const collection = collections[resource] as Collection<any>;
+  const collection = collections[resource as keyof typeof collections];
   const cursor = collection.find(q);
   if (options.projection) {
     let projection = options.projection;
@@ -395,20 +336,27 @@ export async function* query(
     cursor.sort(s);
   }
 
-  for await (let doc of cursor) {
+  for await (let doc of cursor as AsyncIterable<any>) {
     if (resource === "devices") doc = flattenDevice(doc);
     else if (resource === "faults") doc = flattenFault(doc);
     else if (resource === "tasks") doc = flattenTask(doc);
     else if (resource === "presets") doc = flattenPreset(doc);
     else if (resource === "files") doc = flattenFile(doc);
+    else if (resource === "uploads") doc = flattenUpload(doc);
 
     yield doc;
   }
 }
 
 export function count(resource: string, filter: Expression): Promise<number> {
-  const collection = collections[resource] as Collection<any>;
-  filter = evaluate(filter, null, Date.now());
+  const collection = collections[resource as keyof typeof collections];
+  const now = Date.now();
+  filter = filter.evaluate((e) => {
+    if (e instanceof Expression.FunctionCall) {
+      if (e.name === "NOW") return new Expression.Literal(now);
+    }
+    return e;
+  });
   const q = toMongoQuery(filter, resource);
   if (!q) return Promise.resolve(0);
   return collection.countDocuments(q);
@@ -426,7 +374,7 @@ export async function updateDeviceTags(
     if (onOff) add.push(tag);
     else pull.push(tag);
   }
-  const object = {};
+  const object: Record<string, any> = {};
 
   if (add?.length) object["$addToSet"] = { _tags: { $each: add } };
   if (pull?.length) object["$pullAll"] = { _tags: pull };
@@ -457,6 +405,7 @@ export async function putProvision(
       lineOffset: -1,
     });
   } catch (err) {
+    if (!(err instanceof Error)) throw err;
     if (err.stack?.startsWith(`${id}:`)) {
       return Promise.reject(
         new Error(`${err.name} at ${err.stack.split("\n", 1)[0]}`),
@@ -484,6 +433,7 @@ export async function putVirtualParameter(
       lineOffset: -1,
     });
   } catch (err) {
+    if (!(err instanceof Error)) throw err;
     if (err.stack?.startsWith(`${id}:`)) {
       return Promise.reject(
         new Error(`${err.name} at ${err.stack.split("\n", 1)[0]}`),
@@ -590,4 +540,38 @@ export async function deleteFault(id: string): Promise<void> {
 
 export async function deleteTask(id: ObjectId): Promise<void> {
   await collections.tasks.deleteOne({ _id: id });
+}
+export async function deleteUpload(filename: string): Promise<void> {
+  await uploadsBucket.delete(filename as any);
+}
+
+export function getUploadBlob(filename: string): Readable {
+  return uploadsBucket.openDownloadStreamByName(filename);
+}
+
+export async function deleteDeviceUploads(deviceId: string): Promise<void> {
+  const files = await collections.uploads
+    .find({
+      _id: {
+        $regex: `^${escapeRegExp(deviceId)}\\/`,
+      },
+    })
+    .toArray();
+  await Promise.all(files.map((f) => uploadsBucket.delete(f["_id"] as any)));
+}
+
+export async function putView(
+  id: string,
+  object: { script: string },
+): Promise<void> {
+  if (!object.script) object.script = "";
+  const err = await validateViewScript(id, object.script);
+  if (err) throw new Error(err);
+  await collections.views.replaceOne({ _id: id }, object, {
+    upsert: true,
+  });
+}
+
+export async function deleteView(id: string): Promise<void> {
+  await collections.views.deleteOne({ _id: id });
 }

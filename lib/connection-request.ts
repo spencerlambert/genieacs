@@ -1,8 +1,7 @@
 import * as crypto from "node:crypto";
 import * as dgram from "node:dgram";
 import * as http from "node:http";
-import { evaluateAsync } from "./common/expression/util.ts";
-import { Expression } from "./types.ts";
+import Expression, { Value } from "./common/expression.ts";
 import * as auth from "./auth.ts";
 import * as extensions from "./extensions.ts";
 import * as debug from "./debug.ts";
@@ -13,29 +12,34 @@ import * as logger from "../lib/logger.ts";
 
 async function extractAuth(
   exp: Expression,
-  dflt: any,
-): Promise<[string, string, Expression]> {
-  let username, password;
-  const _exp = await evaluateAsync(
-    exp,
-    {},
-    0,
+  dflt: Value,
+): Promise<[string | undefined, string | undefined, Expression]> {
+  let username: string | undefined;
+  let password: string | undefined;
+  const _exp = await exp.evaluateAsync(
     async (e: Expression): Promise<Expression> => {
-      if (!username && Array.isArray(e) && e[0] === "FUNC") {
-        if (e[1] === "EXT") {
-          if (typeof e[2] !== "string" || typeof e[3] !== "string") return null;
+      if (e instanceof Expression.Parameter)
+        return new Expression.Literal(null);
+      if (e instanceof Expression.FunctionCall) {
+        if (e.name === "NOW") return new Expression.Literal(0);
+        if (!username) {
+          if (e.name === "EXT") {
+            if (!e.args.every((a) => a instanceof Expression.Literal))
+              return new Expression.Literal(null);
+            const args = e.args.map((a) => String(a.value));
+            if (typeof args[0] !== "string" || typeof args[1] !== "string")
+              return new Expression.Literal(null);
 
-          for (let i = 4; i < e.length; i++)
-            if (Array.isArray(e[i])) return null;
-
-          const { fault, value } = await extensions.run(e.slice(2));
-          return fault ? null : value;
-        } else if (e[1] === "AUTH") {
-          if (!Array.isArray(e[2]) && !Array.isArray(e[3])) {
-            username = e[2] || "";
-            password = e[3] || "";
+            const { fault, value } = await extensions.run(args);
+            if (fault) return new Expression.Literal(null);
+            return new Expression.Literal(value);
+          } else if (e.name === "AUTH") {
+            if (e.args.every((a) => a instanceof Expression.Literal)) {
+              username = `${e.args[0].value ?? ""}`;
+              password = `${e.args[1].value ?? ""}`;
+            }
+            return new Expression.Literal(dflt);
           }
-          return dflt;
         }
       }
       return e;
@@ -54,7 +58,7 @@ function httpGet(
     const req = http
       .get(url, options, (res) => {
         res.resume();
-        resolve({ statusCode: res.statusCode, headers: res.headers });
+        resolve({ statusCode: res.statusCode ?? 0, headers: res.headers });
         if (_debug) {
           debug.outgoingHttpRequest(req, deviceId, "GET", url, null);
           debug.incomingHttpResponse(res, deviceId, null);
@@ -88,9 +92,9 @@ export async function httpConnectionRequest(
     agent: new http.Agent({ maxSockets: 1, keepAlive: true, timeout: timeout }),
   };
 
-  let authHeader: Record<string, string>;
-  let username: string;
-  let password: string;
+  let authHeader: Record<string, string> | undefined;
+  let username: string | undefined;
+  let password: string | undefined;
 
   while (!authHeader || (username != null && password != null)) {
     let opts = options;
@@ -101,7 +105,7 @@ export async function httpConnectionRequest(
         opts = Object.assign(
           {
             headers: {
-              Authorization: auth.basic(username || "", password || ""),
+              Authorization: auth.basic(username ?? "", password ?? ""),
             },
           },
           options,
@@ -111,11 +115,11 @@ export async function httpConnectionRequest(
           {
             headers: {
               Authorization: auth.solveDigest(
-                username,
-                password,
+                username ?? "",
+                password ?? "",
                 url.pathname + url.search,
                 "GET",
-                null,
+                "",
                 authHeader,
               ),
             },
@@ -131,16 +135,19 @@ export async function httpConnectionRequest(
     try {
       res = await httpGet(url, opts, _debug, deviceId);
     } catch (err) {
+      if (!(err instanceof Error)) throw err;
       // Workaround for some devices unexpectedly closing the connection
       if (authHeader) {
         try {
           res = await httpGet(url, opts, _debug, deviceId);
         } catch (err) {
+          if (!(err instanceof Error)) throw err;
           return `Connection request error: ${err.message}`;
         }
       }
 
-      if (err["code"] === "ECONNRESET" || err["code"] === "ECONNREFUSED")
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ECONNRESET" || code === "ECONNREFUSED")
         return "Device is offline";
 
       return `Connection request error: ${err.message}`;
@@ -157,7 +164,7 @@ export async function httpConnectionRequest(
         authHeader = auth.parseWwwAuthenticateHeader(
           res.headers["www-authenticate"],
         );
-      } catch (err) {
+      } catch {
         return "Connection request error: Error parsing www-authenticate header";
       }
       [username, password, authExp] = await extractAuth(authExp, false);
@@ -188,8 +195,8 @@ export async function udpConnectionRequest(
   // also bind to the same port.
   if (sourcePort) client.bind({ port: sourcePort, exclusive: true });
 
-  let username: string;
-  let password: string;
+  let username: string | undefined;
+  let password: string | undefined;
 
   [username, password, authExp] = await extractAuth(authExp, null);
 
@@ -209,7 +216,7 @@ export async function udpConnectionRequest(
 
     for (let i = 0; i < 3; ++i) {
       await new Promise<void>((resolve, reject) => {
-        client.send(message, 0, message.length, port, host, (err: Error) => {
+        client.send(message, 0, message.length, port, host, (err) => {
           if (err) reject(err);
           else resolve();
           if (_debug) debug.outgoingUdpMessage(host, deviceId, port, msg);
@@ -226,7 +233,7 @@ const XMPP_JID = config.get("XMPP_JID") as string;
 const XMPP_PASSWORD = config.get("XMPP_PASSWORD") as string;
 const XMPP_RESOURCE = crypto.randomBytes(8).toString("hex");
 
-let xmppClient: XmppClient;
+let xmppClient: XmppClient | null;
 
 function xmppClientOnError(err: Error): void {
   xmppClient = null;
@@ -262,8 +269,8 @@ export async function xmppConnectionRequest(
     xmppClient.unref();
   }
 
-  let username: string;
-  let password: string;
+  let username: string | undefined;
+  let password: string | undefined;
 
   [username, password, authExp] = await extractAuth(authExp, null);
   while (username != null && password != null) {
@@ -282,6 +289,7 @@ export async function xmppConnectionRequest(
         timeout,
       ));
     } catch (err) {
+      if (!(err instanceof Error)) throw err;
       return err.message;
     }
     if (_debug) {

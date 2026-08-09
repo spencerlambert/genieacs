@@ -1,26 +1,42 @@
-import { ClosureComponent } from "mithril";
+import { ClosureComponent } from "../mithril-compat.ts";
 import { m } from "../components.ts";
 import * as taskQueue from "../task-queue.ts";
-import { parse } from "../../lib/common/expression/parser.ts";
 import memoize from "../../lib/common/memoize.ts";
-import { getIcon } from "../icons.ts";
-import { QueryResponse, evaluateExpression } from "../store.ts";
+import { icon } from "../icons.ts";
+import { QueryResponse } from "../legacy-store.ts";
+import { evaluateExpression } from "../reactive-store.ts";
 import debounce from "../../lib/common/debounce.ts";
-import { Expression } from "../../lib/types.ts";
+import Expression, { Value } from "../../lib/common/expression.ts";
 import { FlatDevice } from "../../lib/ui/db.ts";
+import Path from "../../lib/common/path.ts";
 
-const memoizedParse = memoize(parse);
-
-function escapeRegExp(str): string {
+function escapeRegExp(str: string): string {
   return str.replace(/[-[\]/{}()*+?.\\^$|]/g, "\\$&");
 }
 
-const keysByDepth: WeakMap<Record<string, unknown>, string[][]> = new WeakMap();
+interface Parameter {
+  path: Expression.Parameter;
+  value?: Value;
+  writable?: boolean;
+  object?: boolean;
+}
 
-function orderKeysByDepth(device: Record<string, unknown>): string[][] {
-  if (keysByDepth.has(device)) return keysByDepth.get(device);
-  const res: string[][] = [];
-  for (const key of Object.keys(device)) {
+const prepareParams = memoize((device: FlatDevice): Parameter[][] => {
+  const map = new Map<string, Parameter>();
+
+  for (const [k, v] of Object.entries(device)) {
+    const [param, attr] = k.split(":");
+    let attrs = map.get(param);
+    if (!attrs)
+      map.set(
+        param,
+        (attrs = { path: new Expression.Parameter(Path.parse(param)) }),
+      );
+    (attrs as unknown as Record<string, unknown>)[attr || "value"] = v;
+  }
+
+  const res: Parameter[][] = [];
+  for (const [key, attrs] of map) {
     let count = 0;
     for (
       let i = key.lastIndexOf(".", key.length - 2);
@@ -29,11 +45,10 @@ function orderKeysByDepth(device: Record<string, unknown>): string[][] {
     )
       ++count;
     while (res.length <= count) res.push([]);
-    res[count].push(key);
+    res[count].push(attrs);
   }
-  keysByDepth.set(device, res);
   return res;
-}
+});
 
 interface Attrs {
   device: FlatDevice;
@@ -51,18 +66,24 @@ const component: ClosureComponent<Attrs> = () => {
   return {
     view: (vnode) => {
       const device = vnode.attrs.device;
+      const allParams = prepareParams(device);
 
-      const limit =
-        (evaluateExpression(vnode.attrs.limit, device) as number) || 100;
+      let limit = 100;
+      if (vnode.attrs.limit) {
+        const l = evaluateExpression(vnode.attrs.limit, device);
+        if (typeof l.value === "number") limit = l.value;
+      }
 
-      const search = m("input", {
-        type: "text",
-        placeholder: "Search parameters",
-        oninput: (e) => {
-          formQueryString(e.target.value);
-          e.redraw = false;
+      const search = m(
+        "input.appearance-none border-0 block w-full px-4 py-3 border-stone-300 placeholder-stone-500 text-stone-900 focus:ring-cyan-500 text-sm rounded-t-lg font-mono focus:ring-2",
+        {
+          type: "text",
+          placeholder: "Search parameters",
+          oninput: (e: { target: HTMLInputElement }) => {
+            formQueryString(e.target.value);
+          },
         },
-      });
+      );
 
       const instanceRegex = /\.[0-9]+$/;
       let re;
@@ -72,37 +93,38 @@ const component: ClosureComponent<Attrs> = () => {
           re = new RegExp(keywords.map((s) => escapeRegExp(s)).join(".*"), "i");
       }
 
-      const filteredKeys: string[] = [];
-      const allKeys = orderKeysByDepth(device);
+      const filteredParams: Parameter[] = [];
       let count = 0;
-      for (const keys of allKeys) {
+      for (const keys of allParams) {
         let c = 0;
         for (const k of keys) {
-          const p = device[k];
-          const str = p.value?.[0] ? `${k} ${p.value[0]}` : k;
+          const str = k.value
+            ? `${k.path.toString()} ${k.value}`
+            : k.path.toString();
           if (re && !re.test(str)) continue;
           ++c;
-          if (count < limit) filteredKeys.push(k);
+          if (count < limit) filteredParams.push(k);
         }
         count += c;
       }
 
-      filteredKeys.sort();
+      filteredParams.sort((a, b) => {
+        if (a.path < b.path) return -1;
+        if (a.path > b.path) return 1;
+        return 0;
+      });
 
-      const rows = filteredKeys.map((k) => {
-        const p = device[k];
+      const rows = filteredParams.map((p) => {
         const val = [];
-        const attrs = { key: k };
-
-        if (p.object === false) {
+        if (p.value) {
           val.push(
             m(
               "parameter",
-              Object.assign({ device: device, parameter: memoizedParse(k) }),
+              Object.assign({ device: device, parameter: p.path }),
             ),
           );
         } else if (p.object && p.writable) {
-          if (instanceRegex.test(k)) {
+          if (instanceRegex.test(p.path.toString())) {
             val.push(
               m(
                 "button",
@@ -111,12 +133,16 @@ const component: ClosureComponent<Attrs> = () => {
                   onclick: () => {
                     taskQueue.queueTask({
                       name: "deleteObject",
-                      device: device["DeviceID.ID"].value[0] as string,
-                      objectName: k,
+                      device: device["DeviceID.ID"] as string,
+                      objectName: p.path.toString(),
                     });
                   },
                 },
-                getIcon("delete-instance"),
+                m(icon, {
+                  name: "delete-instance",
+                  class:
+                    "inline h-4 w-4 ml-1 text-cyan-700 hover:text-cyan-900",
+                }),
               ),
             );
           } else {
@@ -128,12 +154,16 @@ const component: ClosureComponent<Attrs> = () => {
                   onclick: () => {
                     taskQueue.queueTask({
                       name: "addObject",
-                      device: device["DeviceID.ID"].value[0] as string,
-                      objectName: k,
+                      device: device["DeviceID.ID"] as string,
+                      objectName: p.path.toString(),
                     });
                   },
                 },
-                getIcon("add-instance"),
+                m(icon, {
+                  name: "add-instance",
+                  class:
+                    "inline h-4 w-4 ml-1 text-cyan-700 hover:text-cyan-900",
+                }),
               ),
             );
           }
@@ -147,20 +177,25 @@ const component: ClosureComponent<Attrs> = () => {
               onclick: () => {
                 taskQueue.queueTask({
                   name: "getParameterValues",
-                  device: device["DeviceID.ID"].value[0] as string,
-                  parameterNames: [k],
+                  device: device["DeviceID.ID"] as string,
+                  parameterNames: [p.path.toString()],
                 });
               },
             },
-            getIcon("refresh"),
+            m(icon, {
+              name: "refresh",
+              class: "inline h-4 w-4 ml-1 text-cyan-700 hover:text-cyan-900",
+            }),
           ),
         );
 
         return m(
           "tr",
-          attrs,
-          m("td.left", m("long-text", { text: k })),
-          m("td.right", val),
+          m(
+            "td.pl-4 pr-2 py-2 truncate",
+            m("long-text", { text: p.path.toString() }),
+          ),
+          m("td.pr-4 py-2 text-right flex justify-end", val),
         );
       });
 
@@ -168,25 +203,37 @@ const component: ClosureComponent<Attrs> = () => {
         "loading",
         { queries: [vnode.attrs.deviceQuery] },
         m(
-          ".all-parameters",
-          m(
-            "a.download-csv",
-            {
-              href: `api/devices/${encodeURIComponent(
-                device["DeviceID.ID"].value[0],
-              )}.csv`,
-              download: "",
-              style: "float: right;",
-            },
-            "Download",
-          ),
+          ".bg-white shadow-sm rounded-lg",
           search,
           m(
-            ".parameter-list",
-            m("table", m("tbody", rows)),
+            ".overflow-hidden",
             m(
-              "m",
-              `Displaying ${filteredKeys.length} out of ${count} parameters.`,
+              ".overflow-y-scroll h-96 shadow-inner",
+              m(
+                "table.w-full table-fixed font-mono text-xs text-stone-900",
+                m("tbody.divide-y divide-stone-200", rows),
+              ),
+            ),
+            m(
+              "div.text-stone-700 px-4 py-3 flex justify-between items-end",
+              m(
+                "span.text-xs",
+                "Displaying ",
+                m("span.font-medium", "" + filteredParams.length),
+                " out of ",
+                m("span.font-medium", "" + count),
+                " parameters",
+              ),
+              m(
+                "a.text-cyan-700 hover:text-cyan-900 text-sm font-medium",
+                {
+                  href: `/api/devices/${encodeURIComponent(
+                    device["DeviceID.ID"] as string,
+                  )}.csv`,
+                  download: "",
+                },
+                "Download",
+              ),
             ),
           ),
         ),

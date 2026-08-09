@@ -1,17 +1,20 @@
 {
   "compilerOptions": {
     "lib": ["ES2022", "dom"],
-    "module": "ES2022",
+    "module": "Preserve",
     "moduleResolution": "bundler",
     "target": "ES2022",
+    "types": ["node"],
+    "strict": true,
     "resolveJsonModule": true,
     "allowSyntheticDefaultImports": true,
-    "alwaysStrict": true,
     "noImplicitReturns": true,
-    "strictFunctionTypes": true,
     "isolatedModules": true,
     "noEmit": true,
-    "allowImportingTsExtensions": true
+    "allowImportingTsExtensions": true,
+    "skipLibCheck": true,
+    "jsx": "react",
+    "jsxFactory": "m"
   },
   "include": [
     "./bin/*.ts",

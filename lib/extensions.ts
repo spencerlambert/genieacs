@@ -6,7 +6,7 @@ import { Fault } from "./types.ts";
 import { ROOT_DIR } from "./config.ts";
 import * as logger from "./logger.ts";
 
-const TIMEOUT = +config.get("EXT_TIMEOUT");
+const TIMEOUT = Number(config.get("EXT_TIMEOUT"));
 
 const processes: { [script: string]: ChildProcess } = {};
 const jobs = new Map();
@@ -43,7 +43,7 @@ export function run(args: string[]): Promise<{ fault: Fault; value: any }> {
         if (processes[scriptName] === p) delete processes[scriptName];
       });
 
-      p.on("message", (message) => {
+      p.on("message", (message: [number, Fault, unknown]) => {
         const func = jobs.get(message[0]);
         if (func) {
           jobs.delete(message[0]);
@@ -54,12 +54,12 @@ export function run(args: string[]): Promise<{ fault: Fault; value: any }> {
         }
       });
 
-      const rlstdout = readline.createInterface(p.stdout);
+      const rlstdout = readline.createInterface(p.stdout!);
       rlstdout.on("line", (line) => {
         logger.info({ message: `Ext ${scriptName}(${p.pid}): ${line}` });
       });
 
-      const rlstderr = readline.createInterface(p.stderr);
+      const rlstderr = readline.createInterface(p.stderr!);
       rlstderr.on("line", (line) => {
         logger.warn({ message: `Ext ${scriptName}(${p.pid}): ${line}` });
       });

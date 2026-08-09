@@ -2,10 +2,14 @@ import { Fault } from "../lib/types.ts";
 
 const jobs = new Set();
 const fileName = process.argv[2];
-let script;
+let script: Record<
+  string,
+  (args: unknown[], cb: (err: Error | null, res: unknown) => void) => void
+>;
 
-function errorToFault(err: Error): Fault {
-  if (!err) return null;
+function errorToFault(err: unknown): Fault {
+  if (!(err instanceof Error) || !err.name)
+    return { code: "ext", message: `${err}` };
 
   if (!err.name) return { code: "ext", message: `${err}` };
 
@@ -19,16 +23,14 @@ function errorToFault(err: Error): Fault {
   };
 
   if (err.stack) {
-    fault.detail["stack"] = err.stack;
+    const detail = fault.detail as { stack?: string };
+    detail.stack = err.stack;
     // Trim the stack trace
-    const stackTrimIndex = fault.detail["stack"].match(
+    const stackTrimIndex = detail.stack.match(
       /\s+at\s[^\s]+\s\(.*genieacs-ext:.+\)/,
     );
     if (stackTrimIndex) {
-      fault.detail["stack"] = fault.detail["stack"].slice(
-        0,
-        stackTrimIndex.index,
-      );
+      detail.stack = detail.stack.slice(0, stackTrimIndex.index);
     }
   }
 
@@ -43,18 +45,20 @@ process.on("unhandledRejection", (err) => {
 process.on("uncaughtException", (err) => {
   const fault = errorToFault(err);
   jobs.forEach((jobId) => {
-    process.send([jobId, fault, null]);
+    process.send!([jobId, fault, null]);
   });
   jobs.clear();
-  process.disconnect();
+  process.disconnect!();
 });
 
-process.on("message", (message) => {
+process.on("message", (msg) => {
+  const message = msg as [number, [string, ...unknown[]]];
   jobs.add(message[0]);
 
   if (!script) {
-    const cwd = process.env["GENIEACS_EXT_DIR"];
+    const cwd = process.env["GENIEACS_EXT_DIR"]!;
     process.chdir(cwd);
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
     script = require(`${cwd}/${fileName}`);
   }
 
@@ -65,14 +69,14 @@ process.on("message", (message) => {
       code: "ext",
       message: `No such function '${funcName}' in extension '${fileName}'`,
     };
-    process.send([message[0], fault, null]);
+    process.send!([message[0], fault, null]);
     return;
   }
 
-  script[funcName](message[1].slice(1), (err, res) => {
+  script[funcName](message[1].slice(1), (err: Error | null, res: unknown) => {
     if (!jobs.delete(message[0])) return;
 
-    process.send([message[0], errorToFault(err), res]);
+    process.send!([message[0], errorToFault(err), res]);
   });
 });
 

@@ -5,7 +5,14 @@ import * as extensions from "./extensions.ts";
 import * as logger from "./logger.ts";
 import * as scheduling from "./scheduling.ts";
 import Path from "./common/path.ts";
-import { Fault, SessionContext, ScriptResult } from "./types.ts";
+import {
+  Attributes,
+  Fault,
+  SessionContext,
+  ScriptResult,
+  Declaration,
+  Clear,
+} from "./types.ts";
 
 // Used for throwing to exit user script and commit
 const COMMIT = Symbol();
@@ -13,17 +20,33 @@ const COMMIT = Symbol();
 // Used to execute extensions and restart
 const EXT = Symbol();
 
-const UNDEFINED = undefined;
+const UNDEFINED: undefined = undefined;
 
 const context = vm.createContext(undefined, { microtaskMode: "afterEvaluate" });
 
-let state;
+interface SandboxState {
+  sessionContext: SessionContext;
+  revision: number;
+  maxRevision: number;
+  uncommitted: boolean;
+  declarations: Declaration[];
+  extensions: Record<string, string[]>;
+  clear: Clear[];
+  rng: seedrandom.PRNG | null;
+  extCounter: number;
+}
+
+let state: SandboxState;
 
 const runningExtensions = new WeakMap<
   SessionContext,
   Map<string, Promise<Fault>>
 >();
-function runExtension(sessionContext, key, extCall): Promise<Fault> {
+function runExtension(
+  sessionContext: SessionContext,
+  key: string,
+  extCall: string[],
+): Promise<Fault> {
   let re = runningExtensions.get(sessionContext);
   if (!re) {
     re = new Map<string, Promise<Fault>>();
@@ -62,12 +85,16 @@ class SandboxDate {
       number?,
     ]
   ) {
-    if (argumentList.length) return new Date(...argumentList);
+    if (argumentList.length)
+      return new (Date as new (...a: unknown[]) => Date)(...argumentList);
 
     return new Date(state.sessionContext.timestamp);
   }
 
-  public static now(intervalOrCron, variance): number {
+  public static now(
+    intervalOrCron?: number | string,
+    variance?: number,
+  ): number {
     let t = state.sessionContext.timestamp;
 
     if (typeof intervalOrCron === "number") {
@@ -108,18 +135,23 @@ function random(): number {
   return state.rng();
 }
 
-random.seed = function (s) {
+random.seed = function (s: string) {
   state.rng = seedrandom(s);
 };
 
 class ParameterWrapper {
-  public constructor(path: Path, attributes, unpacked?, unpackedRevision?) {
+  public constructor(
+    path: Path,
+    attributes: Iterable<string>,
+    unpacked?: Path[],
+    unpackedRevision?: number,
+  ) {
     for (const attrName of attributes) {
       Object.defineProperty(this, attrName, {
         get: function () {
           if (state.uncommitted) commit();
 
-          if (state.revision !== unpackedRevision) {
+          if (!unpacked || state.revision !== unpackedRevision) {
             unpackedRevision = state.revision;
             unpacked = device.unpack(
               state.sessionContext.deviceData,
@@ -133,7 +165,7 @@ class ParameterWrapper {
           const attr = state.sessionContext.deviceData.attributes.get(
             unpacked[0],
             state.revision,
-          )[attrName];
+          )?.[attrName as keyof Attributes];
 
           if (!attr) return UNDEFINED;
 
@@ -146,7 +178,7 @@ class ParameterWrapper {
       get: function () {
         if (state.uncommitted) commit();
 
-        if (state.revision !== unpackedRevision) {
+        if (!unpacked || state.revision !== unpackedRevision) {
           unpackedRevision = state.revision;
           unpacked = device.unpack(
             state.sessionContext.deviceData,
@@ -165,7 +197,7 @@ class ParameterWrapper {
       get: function () {
         if (state.uncommitted) commit();
 
-        if (state.revision !== unpackedRevision) {
+        if (!unpacked || state.revision !== unpackedRevision) {
           unpackedRevision = state.revision;
           unpacked = device.unpack(
             state.sessionContext.deviceData,
@@ -180,10 +212,10 @@ class ParameterWrapper {
       },
     });
 
-    this[Symbol.iterator] = function* () {
+    (this as any)[Symbol.iterator] = function* () {
       if (state.uncommitted) commit();
 
-      if (state.revision !== unpackedRevision) {
+      if (!unpacked || state.revision !== unpackedRevision) {
         unpackedRevision = state.revision;
         unpacked = device.unpack(
           state.sessionContext.deviceData,
@@ -210,16 +242,16 @@ function declare(
 
   const parsedPath = Path.parse(path);
 
-  const declaration = {
+  const declaration: Declaration = {
     path: parsedPath,
     pathGet: 1,
-    pathSet: null,
-    attrGet: null,
-    attrSet: null,
+    pathSet: undefined,
+    attrGet: undefined,
+    attrSet: undefined,
     defer: true,
   };
 
-  const attrs = new Set();
+  const attrs = new Set<string>();
 
   for (const [attrName, attrValue] of Object.entries(values)) {
     if (attrName === "path") {
@@ -228,10 +260,12 @@ function declare(
       attrs.add(attrName);
       if (!declaration.attrGet) declaration.attrGet = {};
       if (!declaration.attrSet) declaration.attrSet = {};
-      declaration.attrGet[attrName] = 1;
+      (declaration.attrGet as Record<string, number>)[attrName] = 1;
       if (attrName === "value" && !Array.isArray(values.value))
         declaration.attrSet.value = [values.value];
-      else declaration.attrSet[attrName] = values[attrName];
+      else
+        (declaration.attrSet as Record<string, unknown>)[attrName] =
+          values[attrName];
     }
   }
 
@@ -242,7 +276,7 @@ function declare(
     } else {
       attrs.add(attrName);
       if (!declaration.attrGet) declaration.attrGet = {};
-      declaration.attrGet[attrName] = attrTimestamp;
+      (declaration.attrGet as Record<string, number>)[attrName] = attrTimestamp;
     }
   }
 
@@ -251,7 +285,11 @@ function declare(
   return new ParameterWrapper(parsedPath, attrs);
 }
 
-function clear(path: string, timestamp: number, attributes?): void {
+function clear(
+  path: string,
+  timestamp: number,
+  attributes?: Record<string, number>,
+): void {
   state.uncommitted = true;
 
   if (state.revision === state.maxRevision)
@@ -314,10 +352,9 @@ context.random = random;
 vm.runInContext("Math.random = random;", context);
 delete context.random;
 
-function errorToFault(err: Error): Fault {
-  if (!err) return null;
-
-  if (!err.name) return { code: "script", message: `${err}` };
+function errorToFault(err: unknown): Fault {
+  if (!(err instanceof Error) || !err.name)
+    return { code: "script", message: `${err}` };
 
   const fault: Fault = {
     code: `script.${err.name}`,
@@ -329,16 +366,14 @@ function errorToFault(err: Error): Fault {
   };
 
   if (err.stack) {
-    fault.detail["stack"] = err.stack;
+    const detail = fault.detail as { stack?: string };
+    detail.stack = err.stack;
     // Trim the stack trace at the self-executing anonymous wrapper function
-    const stackTrimIndex = fault.detail["stack"].match(
+    const stackTrimIndex = detail.stack.match(
       /\s+at\s[^\s]+\s+at\s[^\s]+\s\(vm\.js.+\)/,
     );
     if (stackTrimIndex) {
-      fault.detail["stack"] = fault.detail["stack"].slice(
-        0,
-        stackTrimIndex.index,
-      );
+      detail.stack = detail.stack.slice(0, stackTrimIndex.index);
     }
   }
 
@@ -391,7 +426,7 @@ export async function run(
   }
 
   const _state = state;
-  let fault;
+  let fault: Fault | undefined;
 
   await Promise.all(
     Object.entries(_state.extensions).map(async ([k, v]) => {

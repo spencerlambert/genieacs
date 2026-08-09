@@ -1,10 +1,10 @@
 import { createHash, randomBytes, pbkdf2 } from "node:crypto";
 
 function parseHeaderFeilds(str: string): Record<string, string> {
-  const res = {};
+  const res: Record<string, string> = {};
   const parts = str.split(",");
 
-  let part: string;
+  let part: string | undefined;
   while ((part = parts.shift()) != null) {
     const name = part.split("=", 1)[0];
     if (name.length === part.length) {
@@ -25,7 +25,7 @@ function parseHeaderFeilds(str: string): Record<string, string> {
       try {
         value = JSON.parse(value);
       } catch (error) {
-        throw new Error("Unable to parse auth header");
+        throw new Error("Unable to parse auth header", { cause: error });
       }
     }
     res[name.trim()] = value;
@@ -33,12 +33,26 @@ function parseHeaderFeilds(str: string): Record<string, string> {
   return res;
 }
 
-export function parseAuthorizationHeader(authHeader: string): {
+export interface AuthorizationHeader {
   method: string;
-} {
+  username?: string;
+  password?: string;
+  nonce?: string;
+  qop?: string;
+  cnonce?: string;
+  nc?: string;
+  uri?: string;
+  response?: string;
+  body?: string;
+  [key: string]: string | undefined;
+}
+
+export function parseAuthorizationHeader(
+  authHeader: string,
+): AuthorizationHeader {
   authHeader = authHeader.trim();
   const method = authHeader.split(" ", 1)[0];
-  const res = { method: method };
+  const res: AuthorizationHeader = { method: method };
 
   if (method === "Basic") {
     // Inspired by https://github.com/jshttp/basic-auth
@@ -48,8 +62,8 @@ export function parseAuthorizationHeader(authHeader: string): {
     );
 
     if (!creds) throw new Error("Unable to parse auth header");
-    res["username"] = creds[1];
-    res["password"] = creds[2];
+    res.username = creds[1];
+    res.password = creds[2];
   } else if (method === "Digest") {
     Object.assign(res, parseHeaderFeilds(authHeader.slice(method.length + 1)));
   }
@@ -105,9 +119,9 @@ export function digest(
   if (qop) {
     hash
       .update(":")
-      .update(nc)
+      .update(nc ?? "")
       .update(":")
-      .update(cnonce)
+      .update(cnonce ?? "")
       .update(":")
       .update(qop);
   }

@@ -17,12 +17,18 @@ import * as init from "./init.ts";
 import { version as VERSION } from "../package.json";
 import memoize from "./common/memoize.ts";
 import { APP_JS, APP_CSS, FAVICON_PNG } from "../build/assets.ts";
+import { matchRoute } from "../ui/router.ts";
 
 const koa = new Koa();
 const router = new Router();
 
 const JWT_SECRET = "" + config.get("UI_JWT_SECRET");
 const JWT_COOKIE = "genieacs-ui-jwt";
+
+interface TokenPayload {
+  authMethod: string;
+  username: string;
+}
 
 const getAuthorizer = memoize(
   (snapshot: string, rolesStr: string): Authorizer => {
@@ -60,11 +66,9 @@ koa.use(
     secret: JWT_SECRET,
     passthrough: true,
     cookie: JWT_COOKIE,
-    isRevoked: async (ctx, token) => {
-      if (token["authMethod"] === "local") {
-        return !localCache.getUsers(ctx.state.configSnapshot)[
-          token["username"]
-        ];
+    isRevoked: async (ctx, token: TokenPayload) => {
+      if (token.authMethod === "local") {
+        return !localCache.getUsers(ctx.state.configSnapshot)[token.username];
       }
 
       return true;
@@ -105,18 +109,26 @@ router.post("/login", async (ctx) => {
 
   const username = ctx.request.body.username;
   const password = ctx.request.body.password;
+  const remember = ctx.request.body.remember;
+  const TWO_WEEKS_SECS = 1209600;
+  const ONE_DAY_SECS = 86400;
 
   const log = {
     message: "Log in",
     context: ctx,
     username: username,
-    method: null,
+    method: null as string | null,
   };
 
-  function success(authMethod): void {
+  function success(authMethod: string): void {
     log.method = authMethod;
-    const token = jwt.sign({ username, authMethod }, JWT_SECRET);
-    ctx.cookies.set(JWT_COOKIE, token, { sameSite: "lax" });
+    const expiresIn = remember ? TWO_WEEKS_SECS : ONE_DAY_SECS;
+    const payload: TokenPayload = { username, authMethod };
+    const token = jwt.sign(payload, JWT_SECRET, { expiresIn });
+    ctx.cookies.set(JWT_COOKIE, token, {
+      sameSite: "lax",
+      maxAge: remember ? expiresIn * 1000 : undefined,
+    });
     ctx.body = JSON.stringify(token);
     logger.accessInfo(log);
   }
@@ -154,8 +166,13 @@ koa.use(async (ctx, next) => {
 koa.use(koaBodyParser());
 router.use("/api", api.routes(), api.allowedMethods());
 
-router.get("/status", (ctx) => {
-  ctx.body = "OK";
+router.get("/health", (ctx) => {
+  ctx.body = {
+    status: "OK",
+    timestamp: Date.now(),
+    configSnapshot: ctx.state.configSnapshot,
+    version: VERSION,
+  };
 });
 
 router.get("/init", async (ctx) => {
@@ -200,31 +217,52 @@ router.post("/init", async (ctx) => {
   ctx.body = "";
 });
 
-router.get("/", async (ctx) => {
-  // koa-router seems to tolerate double slashes in the URL but that can
-  // be problematic when using relatives asset paths in HTML
-  if (ctx.path.endsWith("//")) return;
+function renderIndex(ctx: Koa.Context): void {
+  const ps: PermissionSet[] = ctx.state.authorizer.getPermissionSets();
+  const permissionSets = ps.map((p) =>
+    p.map((s) =>
+      Object.fromEntries(
+        Object.entries(s).map(([resource, { access, validate, filter }]) => [
+          resource,
+          { access, validate: validate.toString(), filter: filter.toString() },
+        ]),
+      ),
+    ),
+  );
 
-  const permissionSets: PermissionSet[] =
-    ctx.state.authorizer.getPermissionSets();
+  if (
+    !Object.keys(localCache.getUsers(ctx.state.configSnapshot)).length &&
+    ctx.path !== "/wizard"
+  ) {
+    ctx.redirect("/wizard");
+    return;
+  }
 
-  let wizard = "";
-  if (!Object.keys(localCache.getUsers(ctx.state.configSnapshot)).length)
-    wizard = '<script>window.location.hash = "#!/wizard";</script>';
+  let viewsUrl: string;
+  if (ctx.state.user) viewsUrl = `/views-bundle-${ctx.state.configSnapshot}.js`;
+  else viewsUrl = "data:application/javascript,export default {}";
 
   ctx.body = `<!DOCTYPE html>
   <html>
     <head>
       <title>GenieACS</title>
-      <link rel="shortcut icon" type="image/png" href="${FAVICON_PNG}" />
-      <link rel="stylesheet" href="${APP_CSS}">
+      <link rel="shortcut icon" type="image/png" href="/${FAVICON_PNG}" />
+      <link rel="stylesheet" href="/${APP_CSS}">
     </head>
-    <body>
-    <noscript>GenieACS UI requires JavaScript to work. Please enable JavaScript in your browser.</noscript>
+    <body class="h-full bg-stone-100">
+      <noscript>GenieACS UI requires JavaScript to work. Please enable JavaScript in your browser.</noscript>
+      <script type="importmap">
+        {
+          "imports": {
+            "views-bundle": "${viewsUrl}"
+          }
+        }
+      </script>
       <script>
-        window.clientConfig = ${JSON.stringify({
-          ui: localCache.getUiConfig(ctx.state.configSnapshot),
-        })};
+        window.clockSkew = ${Date.now()} - Date.now();
+        if (Math.abs(window.clockSkew) > 5000)
+          console.warn("System and server clocks are out of sync by " + window.clockSkew + "ms");
+        window.clientConfig = ${JSON.stringify(localCache.getUiConfig(ctx.state.configSnapshot))};
         window.configSnapshot = ${JSON.stringify(ctx.state.configSnapshot)};
         window.genieacsVersion = ${JSON.stringify(VERSION)};
         window.username = ${JSON.stringify(
@@ -232,10 +270,28 @@ router.get("/", async (ctx) => {
         )};
         window.permissionSets = ${JSON.stringify(permissionSets)};
       </script>
-      <script type="module" src="${APP_JS}"></script>${wizard} 
+      <script type="module" src="/${APP_JS}"></script>
     </body>
   </html>
   `;
+}
+
+router.get("(.*)", (ctx, next) => {
+  const match = matchRoute(ctx.path);
+  if (!match) return next();
+  if (match.pathname === ctx.path) return renderIndex(ctx);
+  ctx.status = 301;
+  ctx.redirect(match.pathname);
+});
+
+router.get("/views-bundle-:revision.js", async (ctx) => {
+  if (!ctx.state.user) return void (ctx.status = 403);
+  try {
+    ctx.body = localCache.getViewsBundle(ctx.params.revision);
+    ctx.set({ "Content-Type": "application/javascript" });
+  } catch {
+    ctx.status = 404;
+  }
 });
 
 koa.use(
@@ -265,7 +321,7 @@ koa.use(async (ctx, next) => {
   try {
     await koaSend(ctx, ctx.path, { root: config.ROOT_DIR + "/public" });
   } catch (err) {
-    if (err.status !== 404) throw err;
+    if ((err as { status?: number }).status !== 404) throw err;
   }
 });
 

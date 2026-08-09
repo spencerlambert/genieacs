@@ -4,8 +4,7 @@ import Path from "./common/path.ts";
 import PathSet from "./common/path-set.ts";
 import VersionedMap from "./versioned-map.ts";
 import InstanceSet from "./instance-set.ts";
-
-export type Expression = string | number | boolean | null | any[];
+import Expression, { Value } from "./common/expression.ts";
 
 export interface Fault {
   code: string;
@@ -22,10 +21,10 @@ export interface Fault {
 
 export interface SessionFault extends Fault {
   timestamp: number;
-  provisions: string[][];
+  provisions: [string, ...Value[]][];
   retryNow?: boolean;
   precondition?: boolean;
-  retries?: number;
+  retries: number;
   expiry?: number;
 }
 
@@ -91,7 +90,7 @@ export interface SyncState {
     accessList: Set<Path>;
   };
   spv: Map<Path, [string | number | boolean, string]>;
-  spa: Map<Path, { notification: number; accessList: string[] }>;
+  spa: Map<Path, { notification: number | null; accessList: string[] | null }>;
   gpn: Set<Path>;
   gpnPatterns: Map<Path, number>;
   tags: Map<Path, boolean>;
@@ -102,18 +101,22 @@ export interface SyncState {
   downloadsToCreate: InstanceSet;
   downloadsValues: Map<Path, string | number>;
   downloadsDownload: Map<Path, number>;
+  uploadsToDelete: Set<Path>;
+  uploadsToCreate: InstanceSet;
+  uploadsValues: Map<Path, string | number>;
+  uploadsUpload: Map<Path, number>;
   reboot: number;
   factoryReset: number;
 }
 
 export interface SessionContext {
-  sessionId?: string;
+  sessionId: string;
   timestamp: number;
   deviceId: string;
   deviceData: DeviceData;
   cwmpVersion: string;
   timeout: number;
-  provisions: any[];
+  provisions: [string, ...Value[]][];
   channels: { [channel: string]: number };
   virtualParameters: [
     string,
@@ -128,26 +131,26 @@ export interface SessionContext {
   cycle: number;
   extensionsCache: any;
   declarations: Declaration[][];
-  faults?: { [channel: string]: SessionFault };
-  retries?: { [channel: string]: number };
-  cacheSnapshot?: string;
-  httpResponse?: ServerResponse;
-  httpRequest?: IncomingMessage;
-  faultsTouched?: { [channel: string]: boolean };
-  presetCycles?: number;
-  new?: boolean;
-  debug?: boolean;
+  faults: { [channel: string]: SessionFault };
+  retries: { [channel: string]: number };
+  cacheSnapshot: string;
+  httpResponse: ServerResponse;
+  httpRequest: IncomingMessage;
+  faultsTouched: { [channel: string]: boolean };
+  presetCycles: number;
+  new: boolean;
+  debug: boolean;
   state: number;
   authState: number;
-  tasks?: Task[];
-  operations?: { [commandKey: string]: Operation };
-  syncState?: SyncState;
-  lastActivity?: number;
-  extendLock?: number;
-  rpcRequest?: AcsRequest;
-  operationsTouched?: { [commandKey: string]: 1 | 0 };
-  provisionsRet?: any[];
-  doneTasks?: string[];
+  tasks: Task[];
+  operations: { [commandKey: string]: Operation };
+  syncState: SyncState | undefined;
+  lastActivity: number;
+  extendLock: number;
+  rpcRequest: AcsRequest | undefined;
+  operationsTouched: { [commandKey: string]: 1 | 0 };
+  provisionsRet: any[];
+  doneTasks: string[];
 }
 
 export interface Task {
@@ -160,20 +163,20 @@ export interface Task {
   fileName?: string;
   targetFileName?: string;
   expiry?: number;
-  provisions?: [string, ...Expression[]][];
+  provisions?: [string, ...Value[]][];
 }
 
 export interface Operation {
   name: string;
   timestamp: number;
-  provisions: string[][];
+  provisions: [string, ...Value[]][];
   channels: { [channel: string]: number };
   retries: { [channel: string]: number };
   args: {
     instance: string;
     fileType: string;
     fileName: string;
-    targetFileName: string;
+    targetFileName?: string;
   };
 }
 
@@ -187,7 +190,8 @@ export type AcsRequest =
   | DeleteObject
   | FactoryReset
   | Reboot
-  | Download;
+  | Download
+  | Upload;
 
 export interface GetParameterNames {
   name: "GetParameterNames";
@@ -215,7 +219,7 @@ export interface SetParameterValues {
 
 export interface SetParameterAttributes {
   name: "SetParameterAttributes";
-  parameterList: [string, number, string[]][];
+  parameterList: [string, number | null, string[] | null][];
 }
 
 export interface AddObject {
@@ -252,9 +256,21 @@ export interface Download {
   password?: string;
   fileSize?: number;
   targetFileName?: string;
-  delaySecods?: number;
+  delaySeconds?: number;
   successUrl?: string;
   failureUrl?: string;
+}
+
+export interface Upload {
+  name: "Upload";
+  commandKey: string;
+  instance: string;
+  fileType: string;
+  fileName?: string;
+  url?: string;
+  username?: string;
+  password?: string;
+  delaySeconds?: number;
 }
 
 export interface SpvFault {
@@ -285,7 +301,8 @@ export type CpeResponse =
   | DeleteObjectResponse
   | RebootResponse
   | FactoryResetResponse
-  | DownloadResponse;
+  | DownloadResponse
+  | UploadResponse;
 
 export interface GetParameterNamesResponse {
   name: "GetParameterNamesResponse";
@@ -337,6 +354,13 @@ export interface DownloadResponse {
   completeTime?: number;
 }
 
+export interface UploadResponse {
+  name: "UploadResponse";
+  status: number;
+  startTime?: number;
+  completeTime?: number;
+}
+
 export type CpeRequest =
   | InformRequest
   | TransferCompleteRequest
@@ -358,7 +382,7 @@ export interface InformRequest {
 
 export interface TransferCompleteRequest {
   name: "TransferComplete";
-  commandKey?: string;
+  commandKey: string;
   faultStruct?: FaultStruct;
   startTime?: number;
   completeTime?: number;
@@ -408,21 +432,25 @@ export interface QueryOptions {
 export interface Declaration {
   path: Path;
   pathGet: number;
-  pathSet?: number | [number, number];
-  attrGet?: {
-    object?: number;
-    writable?: number;
-    value?: number;
-    notification?: number;
-    accessList?: number;
-  };
-  attrSet?: {
-    object?: boolean;
-    writable?: boolean;
-    value?: [string | number | boolean, string?];
-    notification?: number;
-    accessList?: string[];
-  };
+  pathSet: number | [number, number] | undefined;
+  attrGet:
+    | {
+        object?: number;
+        writable?: number;
+        value?: number;
+        notification?: number;
+        accessList?: number;
+      }
+    | undefined;
+  attrSet:
+    | {
+        object?: boolean;
+        writable?: boolean;
+        value?: [string | number | boolean, string?];
+        notification?: number;
+        accessList?: string[];
+      }
+    | undefined;
   defer: boolean;
 }
 
@@ -443,8 +471,8 @@ export interface Preset {
   name: string;
   channel: string;
   schedule?: { md5: string; duration: number; schedule: any };
-  events?: { [event: string]: boolean };
-  precondition?: Expression;
+  events: { [event: string]: boolean };
+  precondition: Expression;
   provisions: [string, ...Expression[]][];
 }
 
@@ -454,6 +482,10 @@ export interface Provisions {
 
 export interface VirtualParameters {
   [name: string]: { md5: string; script: Script };
+}
+
+export interface Views {
+  [name: string]: { md5: string; script: string };
 }
 
 export interface Files {
@@ -470,7 +502,7 @@ export interface Permissions {
       [resource: string]: {
         access: number;
         filter: Expression;
-        validate?: Expression;
+        validate: Expression;
       };
     };
   };
@@ -479,7 +511,7 @@ export interface Permissions {
 export type PermissionSet = {
   [resource: string]: {
     access: number;
-    validate?: Expression;
+    validate: Expression;
     filter: Expression;
   };
 }[];
@@ -488,16 +520,7 @@ export interface Config {
   [name: string]: Expression;
 }
 
-export interface UiConfig {
-  filters: Record<string, unknown>;
-  device: Record<string, unknown>;
-  index: Record<string, unknown>;
-  overview: {
-    charts?: Record<string, unknown>;
-    groups?: Record<string, unknown>;
-  };
-  pageSize?: Expression;
-}
+export type UiConfig = Record<string, string>;
 
 export interface SoapMessage {
   id: string;
@@ -510,9 +533,9 @@ export interface SoapMessage {
 }
 
 export interface ScriptResult {
-  fault: Fault;
-  clear: Clear[];
-  declare: Declaration[];
+  fault: Fault | null;
+  clear: Clear[] | null;
+  declare: Declaration[] | null;
   done: boolean;
   returnValue: any;
 }

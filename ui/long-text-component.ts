@@ -1,57 +1,43 @@
-import m, { ClosureComponent, Component } from "mithril";
 import * as overlay from "./overlay.ts";
+import { textarea, span } from "./dom.ts";
 
-const component: ClosureComponent = (): Component => {
-  return {
-    view: (vnode) => {
-      const text = vnode.attrs["text"];
-      const element = vnode.attrs["element"] || "span";
+interface LongTextAttrs {
+  text: string;
+  class?: string;
+}
 
-      function overflowed(_vnode): void {
-        _vnode.dom.classList.add("long-text-overflowed");
-        _vnode.dom.onclick = (e) => {
-          overlay.open(() => {
-            return m("textarea.long-text", {
-              value: text,
-              cols: 80,
-              rows: 24,
-              readonly: "",
-              oncreate: (vnode2) => {
-                (vnode2.dom as HTMLTextAreaElement).focus();
-                (vnode2.dom as HTMLTextAreaElement).select();
-              },
+export function createLongText(attrs: LongTextAttrs): HTMLSpanElement {
+  const text = attrs.text || "";
+  const className = attrs.class || "";
+
+  const el = span(
+    {
+      class: "block truncate decoration-dotted max-w-full " + className,
+      onMount: () => {
+        const w = Math.round(el.getBoundingClientRect().width);
+        if (w !== el.scrollWidth) {
+          el.title = text;
+          el.className += " cursor-pointer hover:underline";
+          el.onclick = (e) => {
+            overlay.open(() => {
+              const ta = textarea({
+                class:
+                  "font-mono text-sm focus:ring-cyan-500 focus:border-cyan-500 border border-stone-300 rounded-md",
+                value: text,
+                cols: 80,
+                rows: 24,
+                readonly: true,
+              });
+              setTimeout(() => ta.focus(), 0);
+              return ta;
             });
-          });
-          // prevent index page selection
-          e.stopPropagation();
-          m.redraw();
-        };
-      }
-
-      return m(
-        element,
-        {
-          oncreate: (vnode2) => {
-            if (vnode2.dom.clientWidth !== vnode2.dom.scrollWidth)
-              overflowed(vnode2);
-          },
-          onupdate: (vnode2) => {
-            if (vnode2.dom.clientWidth === vnode2.dom.scrollWidth) {
-              (vnode2.dom as HTMLElement).classList.remove(
-                "long-text-overflowed",
-              );
-              (vnode2.dom as HTMLElement).onclick = null;
-            } else {
-              overflowed(vnode2);
-            }
-          },
-          class: "long-text",
-          title: text,
-        },
-        text,
-      );
+            e.stopPropagation();
+          };
+        }
+      },
     },
-  };
-};
+    text,
+  );
 
-export default component;
+  return el;
+}

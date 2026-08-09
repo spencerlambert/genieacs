@@ -1,3 +1,4 @@
+import Expression, { Value } from "./common/expression.ts";
 import Path from "./common/path.ts";
 import {
   DeviceData,
@@ -15,7 +16,7 @@ const CHANGE_FLAGS = {
   accessList: 32,
 };
 
-function parseBool(v): boolean {
+function parseBool(v: unknown): boolean | null {
   v = "" + v;
   if (v === "true" || v === "TRUE" || v === "True" || v === "1") return true;
   else if (v === "false" || v === "FALSE" || v === "False" || v === "0")
@@ -24,8 +25,8 @@ function parseBool(v): boolean {
 }
 
 export function sanitizeParameterValue(
-  parameterValue: [string | number | boolean, string],
-): [string | number | boolean, string] {
+  parameterValue: [string | number | boolean | null, string],
+): [string | number | boolean | null, string] {
   if (parameterValue[0] != null) {
     switch (parameterValue[1]) {
       case "xsd:boolean":
@@ -68,25 +69,25 @@ export function sanitizeParameterValue(
 export function getAliasDeclarations(
   path: Path,
   timestamp: number,
-  attrGet = null,
+  attrGet?: Declaration["attrGet"],
 ): Declaration[] {
   const stripped = path.stripAlias();
   let decs: Declaration[] = [
     {
       path: stripped,
       pathGet: timestamp,
-      pathSet: null,
+      pathSet: undefined,
       attrGet: attrGet,
-      attrSet: null,
+      attrSet: undefined,
       defer: true,
     },
   ];
 
   if (path.alias) {
     for (const [i, alias] of path.segments.entries()) {
-      if (Array.isArray(alias)) {
+      if (alias instanceof Expression) {
         const parent = stripped.slice(0, i + 1);
-        for (const [p] of alias as [Path, string][]) {
+        for (const [p] of expressionToAlias(alias)) {
           decs = decs.concat(
             getAliasDeclarations(parent.concat(p), timestamp, {
               value: timestamp,
@@ -100,24 +101,42 @@ export function getAliasDeclarations(
   return decs;
 }
 
+export function expressionToAlias(exp: Expression): [Path, Value][] {
+  if (exp instanceof Expression.Literal && exp.value === true) return [];
+  if (exp instanceof Expression.Binary) {
+    if (exp.operator === "AND")
+      return [...expressionToAlias(exp.left), ...expressionToAlias(exp.right)];
+    else if (exp.operator === "=") {
+      if (
+        exp.left instanceof Expression.Parameter &&
+        exp.right instanceof Expression.Literal
+      )
+        return [[exp.left.path, exp.right.value]];
+    }
+  }
+  throw new Error("Invalid alias expression");
+}
+
 export function unpack(
   deviceData: DeviceData,
   path: Path,
   revision?: number,
 ): Path[] {
-  let allMatches = [] as Path[];
+  let allMatches: (Path | null)[] = [];
   if (!path.alias) {
-    for (const p of deviceData.paths.find(path, false, true))
+    for (const p of deviceData.paths.findCompat(path, false, true))
       if (deviceData.attributes.has(p, revision)) allMatches.push(p);
   } else {
     const wildcardPath = path.stripAlias();
 
-    for (const p of deviceData.paths.find(wildcardPath, false, true))
+    for (const p of deviceData.paths.findCompat(wildcardPath, false, true))
       if (deviceData.attributes.has(p, revision)) allMatches.push(p);
 
     for (let i = path.length - 1; i >= 0; --i) {
       if (path.alias & (1 << i)) {
-        for (const [param, val] of path.segments[i] as [Path, string][]) {
+        for (const [param, val] of expressionToAlias(
+          path.segments[i] as Expression,
+        )) {
           const p = wildcardPath.slice(0, i + 1).concat(param);
           const unpacked = unpack(deviceData, p, revision);
           const filtered: Path[] = [];
@@ -150,7 +169,8 @@ export function unpack(
     }
   }
 
-  allMatches.sort((p1, p2) => {
+  const matches = allMatches as Path[];
+  matches.sort((p1, p2) => {
     for (let i = 0; i < p1.length; ++i) {
       const a = p1.segments[i] as string;
       const b = p2.segments[i] as string;
@@ -167,17 +187,17 @@ export function unpack(
     return 0;
   });
 
-  return allMatches;
+  return matches;
 }
 
 export function clear(
   deviceData: DeviceData,
   path: Path,
   timestamp: number,
-  attributes: AttributeTimestamps,
+  attributes: AttributeTimestamps | undefined,
   changeFlags = 0,
 ): void {
-  const changeTrackers = {};
+  const changeTrackers: Record<string, number> = {};
 
   timestamp = timestamp || 0;
 
@@ -185,11 +205,11 @@ export function clear(
   if (attributes?.object) {
     if (attributes.object > descendantsTimestamp)
       descendantsTimestamp = attributes.object;
-    if (!(attributes.object <= attributes.value))
+    if (attributes.value == null || !(attributes.object <= attributes.value))
       attributes.value = attributes.object;
   }
 
-  for (const p of deviceData.paths.find(
+  for (const p of deviceData.paths.findCompat(
     path,
     true,
     true,
@@ -211,18 +231,17 @@ export function clear(
     } else if (attributes && p.length === path.length) {
       const currentAttributes = deviceData.attributes.get(p);
       if (currentAttributes) {
-        let newAttrs;
+        let newAttrs: Attributes | undefined;
         for (const attrName in attributes) {
-          if (
-            attrName in currentAttributes &&
-            attributes[attrName] > currentAttributes[attrName][0]
-          ) {
-            changeFlags |= CHANGE_FLAGS[attrName];
+          const n = attrName as keyof Attributes;
+          const cur = currentAttributes[n];
+          if (cur && attributes[n]! > cur[0]) {
+            changeFlags |= CHANGE_FLAGS[n];
             if (!newAttrs) {
               newAttrs = Object.assign({}, currentAttributes);
               deviceData.attributes.set(p, newAttrs);
             }
-            delete newAttrs[attrName];
+            delete newAttrs[n];
           }
         }
       }
@@ -235,7 +254,7 @@ export function clear(
     if (changeTrackers[k] & changeFlags) deviceData.changes.add(k);
 }
 
-function compareEquality(a, b): boolean {
+function compareEquality(a: unknown, b: unknown): boolean {
   const t = typeof a;
   if (
     a === null ||
@@ -252,12 +271,12 @@ function compareEquality(a, b): boolean {
 
 export function set(
   deviceData: DeviceData,
-  path: Path,
+  pathStr: string,
   timestamp: number,
-  attributes: Attributes,
-  toClear?: Clear[],
+  attributes: Attributes | undefined,
+  toClear: Clear[] = [],
 ): Clear[] {
-  path = deviceData.paths.add(path);
+  const path = deviceData.paths.add(pathStr);
 
   const currentTimestamp = deviceData.timestamps.get(path);
 
@@ -281,25 +300,28 @@ export function set(
       attributes.object &&
       attributes.object[1] &&
       attributes.object[0] >= (attributes.value ? attributes.value[0] : 0)
-    )
-      attributes.value = [attributes.object[0], null];
+    ) {
+      // TODO: tombstone needed by per-attribute timestamp merge below to reject
+      // stale value writes; not restored on DB reload (cwmp/db.ts), so the
+      // canonical representation is inconsistent. Revisit: either restore on
+      // load, or drop the tombstone and use object[0] as the floor in merge.
+      attributes.value = [
+        attributes.object[0],
+        null as unknown as [string | number | boolean, string],
+      ];
+    }
 
     const newAttributes = Object.assign({}, currentAttributes, attributes);
 
     if (currentAttributes) {
       for (const attrName in attributes) {
-        timestamp = Math.max(timestamp, attributes[attrName][0]);
-        if (!(attrName in currentAttributes))
-          changeFlags |= CHANGE_FLAGS[attrName];
-        else if (attributes[attrName][0] <= currentAttributes[attrName][0])
-          newAttributes[attrName] = currentAttributes[attrName];
-        else if (
-          !compareEquality(
-            attributes[attrName][1],
-            currentAttributes[attrName][1],
-          )
-        )
-          changeFlags |= CHANGE_FLAGS[attrName];
+        const n = attrName as keyof Attributes;
+        const a = attributes[n]!;
+        timestamp = Math.max(timestamp, a[0]);
+        const cur = currentAttributes[n];
+        if (!cur) changeFlags |= CHANGE_FLAGS[n];
+        else if (a[0] <= cur[0]) (newAttributes[n] as unknown) = cur;
+        else if (!compareEquality(a[1], cur[1])) changeFlags |= CHANGE_FLAGS[n];
       }
     } else {
       changeFlags |= 1;
@@ -307,43 +329,49 @@ export function set(
 
     deviceData.attributes.set(path, newAttributes);
 
-    if (!(timestamp <= currentTimestamp)) {
+    if (currentTimestamp == null || timestamp > currentTimestamp) {
       deviceData.timestamps.set(path, timestamp);
       if (path.length > 1) {
         toClear = set(
           deviceData,
-          path.slice(0, path.length - 1),
+          path.slice(0, path.length - 1).toString(),
           timestamp,
           { object: [timestamp, 1] },
           toClear,
         );
       }
     }
-  } else if (!(timestamp <= currentTimestamp)) {
+  } else if (currentTimestamp == null || timestamp > currentTimestamp) {
     deviceData.timestamps.set(path, timestamp);
 
     if (currentAttributes) {
       deviceData.attributes.delete(path);
       changeFlags |= 1;
     } else if (path.wildcard) {
-      for (const p of deviceData.paths.find(path, false, true, path.length)) {
-        if (timestamp > deviceData.timestamps.get(p)) {
-          toClear = toClear || [];
+      for (const p of deviceData.paths.findCompat(
+        path,
+        false,
+        true,
+        path.length,
+      )) {
+        if (timestamp > deviceData.timestamps.get(p)!)
           toClear.push([p, timestamp]);
-        }
       }
     }
   }
 
   if (changeFlags) {
     if (changeFlags & 1) {
-      toClear = toClear || [];
-      toClear.push([path, timestamp, null, changeFlags]);
-    } else if (changeFlags & CHANGE_FLAGS.object) {
-      toClear = toClear || [];
+      toClear.push([path, timestamp, undefined, changeFlags]);
+    } else if (changeFlags & CHANGE_FLAGS.object && attributes?.object) {
       toClear.push([path, 0, { object: attributes.object[0] }, changeFlags]);
     } else {
-      for (const p of deviceData.paths.find(path, true, false, path.length)) {
+      for (const p of deviceData.paths.findCompat(
+        path,
+        true,
+        false,
+        path.length,
+      )) {
         const tracker = deviceData.trackers.get(p);
         for (const k in tracker)
           if (tracker[k] & changeFlags) deviceData.changes.add(k);
@@ -356,15 +384,16 @@ export function set(
 
 export function track(
   deviceData: DeviceData,
-  path: Path,
+  pathStr: string,
   marker: string,
   attributes?: string[],
 ): void {
-  path = deviceData.paths.add(path);
+  const path = deviceData.paths.add(pathStr);
   let f = 1;
 
   if (attributes)
-    for (const attrName of attributes) f |= CHANGE_FLAGS[attrName];
+    for (const attrName of attributes)
+      f |= CHANGE_FLAGS[attrName as keyof typeof CHANGE_FLAGS];
 
   let cur = deviceData.trackers.get(path);
   if (!cur) {

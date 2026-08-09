@@ -1,69 +1,83 @@
-import { ClosureComponent, Component, Children } from "mithril";
-import { m } from "./components.ts";
-import config from "./config.ts";
-import filterComponent from "./filter-component.ts";
-import * as store from "./store.ts";
+import { navigate } from "./router.ts";
+import { pageSize as PAGE_SIZE } from "./config.ts";
+import { createFilter } from "./filter-component.ts";
+import { createIndexTable } from "./index-table-component.ts";
+import {
+  pagedFetch,
+  count as reactiveCount,
+  invalidate,
+} from "./reactive-store.ts";
+import { StateSignal } from "./signals.ts";
+import { putResource, deleteResource, resourceExists } from "./api-client.ts";
 import * as notifications from "./notifications.ts";
-import memoize from "../lib/common/memoize.ts";
-import putFormComponent from "./put-form-component.ts";
-import indexTableComponent from "./index-table-component.ts";
+import { createPutForm, type PutFormResult } from "./put-form-component.ts";
 import * as overlay from "./overlay.ts";
 import * as smartQuery from "./smart-query.ts";
-import { map, parse, stringify } from "../lib/common/expression/parser.ts";
+import Expression from "../lib/common/expression.ts";
 import { loadCodeMirror } from "./dynamic-loader.ts";
-
-const PAGE_SIZE = config.ui.pageSize || 10;
-
-const memoizedParse = memoize(parse);
-const memoizedJsonParse = memoize(JSON.parse);
+import { div, h1, button } from "./dom.ts";
 
 const attributes = [
   { id: "_id", label: "Name" },
-  { id: "script", label: "Script", type: "code" },
+  { id: "script", label: "Script", type: "code", mode: "javascript" },
 ];
 
-const unpackSmartQuery = memoize((query) => {
-  return map(query, (e) => {
-    if (Array.isArray(e) && e[0] === "FUNC" && e[1] === "Q")
-      return smartQuery.unpack("virtualParameters", e[2], e[3]);
+function unpackSmartQuery(query: Expression): Expression {
+  return query.evaluate((e) => {
+    if (e instanceof Expression.FunctionCall) {
+      if (e.name === "Q") {
+        if (
+          e.args[0] instanceof Expression.Literal &&
+          e.args[1] instanceof Expression.Literal
+        ) {
+          return smartQuery.unpack(
+            "virtualParameters",
+            e.args[0].value as string,
+            e.args[1].value as string,
+          );
+        }
+      }
+    }
     return e;
   });
-});
+}
 
 interface ValidationErrors {
   [prop: string]: string;
 }
 
-function putActionHandler(action, _object, isNew): Promise<ValidationErrors> {
+function putActionHandler(
+  action: string,
+  _object: Record<string, unknown>,
+  isNew: boolean,
+): Promise<ValidationErrors | null> {
   return new Promise((resolve, reject) => {
     const object = Object.assign({}, _object);
     if (action === "save") {
-      const id = object["_id"];
+      const id = object["_id"] as string;
       delete object["_id"];
 
       if (!id) return void resolve({ _id: "ID can not be empty" });
 
-      store
-        .resourceExists("virtualParameters", id)
+      resourceExists("virtualParameters", id)
         .then((exists) => {
           if (exists && isNew) {
-            store.setTimestamp(Date.now());
+            invalidate(Date.now());
             return void resolve({ _id: "Virtual parameter already exists" });
           }
 
           if (!exists && !isNew) {
-            store.setTimestamp(Date.now());
+            invalidate(Date.now());
             return void resolve({ _id: "Virtual parameter does not exist" });
           }
 
-          store
-            .putResource("virtualParameters", id, object)
+          putResource("virtualParameters", id, object)
             .then(() => {
               notifications.push(
                 "success",
                 `Virtual parameter ${exists ? "updated" : "created"}`,
               );
-              store.setTimestamp(Date.now());
+              invalidate(Date.now());
               resolve(null);
             })
             .catch((err) => {
@@ -76,15 +90,16 @@ function putActionHandler(action, _object, isNew): Promise<ValidationErrors> {
         })
         .catch(reject);
     } else if (action === "delete") {
-      store
-        .deleteResource("virtualParameters", object["_id"])
+      if (!confirm("Deleting virtual parameter. Are you sure?"))
+        return void resolve(null);
+      deleteResource("virtualParameters", object["_id"] as string)
         .then(() => {
           notifications.push("success", "Virtual parameter deleted");
-          store.setTimestamp(Date.now());
+          invalidate(Date.now());
           resolve(null);
         })
         .catch((err) => {
-          store.setTimestamp(Date.now());
+          invalidate(Date.now());
           reject(err);
         });
     } else {
@@ -98,246 +113,250 @@ const formData = {
   attributes: attributes,
 };
 
-const getDownloadUrl = memoize((filter) => {
-  const cols = {};
+function getDownloadUrl(filter: Expression): string {
+  const cols: Record<string, string> = {};
   for (const attr of attributes) cols[attr.label] = attr.id;
-  return `api/virtualParameters.csv?${m.buildQueryString({
-    filter: stringify(filter),
+  return `/api/virtualParameters.csv?${new URLSearchParams({
+    filter: filter.toString(),
     columns: JSON.stringify(cols),
-  })}`;
-});
+  }).toString()}`;
+}
 
-export function init(
-  args: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
+export interface Attrs {
+  filter?: Expression;
+  sort?: Record<string, number>;
+}
+
+export function init(args: URLSearchParams): Promise<Attrs> {
   if (!window.authorizer.hasAccess("virtualParameters", 2)) {
     return Promise.reject(
       new Error("You are not authorized to view this page"),
     );
   }
 
-  const sort = args.hasOwnProperty("sort") ? "" + args["sort"] : "";
-  const filter = args.hasOwnProperty("filter") ? "" + args["filter"] : "";
-
-  return new Promise((resolve, reject) => {
-    loadCodeMirror()
-      .then(() => {
-        resolve({ filter, sort });
-      })
-      .catch(reject);
-  });
+  const filterStr = args.get("filter");
+  const sortStr = args.get("sort");
+  const attrs: Attrs = {
+    filter: filterStr ? Expression.parse(filterStr) : undefined,
+    sort: sortStr ? JSON.parse(sortStr) : undefined,
+  };
+  return loadCodeMirror().then(() => attrs);
 }
 
-export const component: ClosureComponent = (): Component => {
-  return {
-    view: (vnode) => {
-      document.title = "Virtual Parameters - GenieACS";
+export function createPage(attrs: Attrs): HTMLElement {
+  document.title = "Virtual Parameters - GenieACS";
 
-      function showMore(): void {
-        vnode.state["showCount"] =
-          (vnode.state["showCount"] || PAGE_SIZE) + PAGE_SIZE;
-        m.redraw();
-      }
+  const showCount = new StateSignal(PAGE_SIZE);
 
-      function onFilterChanged(filter): void {
-        const ops = { filter };
-        if (vnode.attrs["sort"]) ops["sort"] = vnode.attrs["sort"];
-        m.route.set("/admin/virtualParameters", ops);
-      }
+  const sort = attrs.sort ?? {};
 
-      const sort = vnode.attrs["sort"]
-        ? memoizedJsonParse(vnode.attrs["sort"])
-        : {};
+  const filter = unpackSmartQuery(attrs.filter ?? new Expression.Literal(true));
 
-      const sortAttributes = {};
-      for (let i = 0; i < attributes.length; i++)
-        sortAttributes[i] = sort[attributes[i].id] || 0;
+  // Reactive data signals
+  const virtualParametersQuery = (): { value: unknown[]; loading: boolean } =>
+    pagedFetch("virtualParameters", filter, {
+      sort,
+      limit: showCount.get(),
+    });
+  const countQuery = reactiveCount("virtualParameters", filter);
 
-      function onSortChange(sortAttrs): void {
-        const _sort = {};
-        for (const index of sortAttrs)
-          _sort[attributes[Math.abs(index) - 1].id] = Math.sign(index);
-        const ops = { sort: JSON.stringify(_sort) };
-        if (vnode.attrs["filter"]) ops["filter"] = vnode.attrs["filter"];
-        m.route.set("/admin/virtualParameters", ops);
-      }
+  const downloadUrl = getDownloadUrl(filter);
 
-      let filter = vnode.attrs["filter"]
-        ? memoizedParse(vnode.attrs["filter"])
-        : true;
-      filter = unpackSmartQuery(filter);
+  const sortAttributes: Record<number, number> = {};
+  for (let i = 0; i < attributes.length; i++)
+    sortAttributes[i] = sort[attributes[i].id] || 0;
 
-      const virtualParameters = store.fetch("virtualParameters", filter, {
-        limit: vnode.state["showCount"] || PAGE_SIZE,
-        sort: sort,
-      });
+  function onFilterChanged(f: Expression): void {
+    const ops: Record<string, string> = {};
+    if (!(f instanceof Expression.Literal && f.value))
+      ops["filter"] = f.toString();
+    if (attrs.sort) ops["sort"] = JSON.stringify(attrs.sort);
+    void navigate("/virtualParameters", ops);
+  }
 
-      const count = store.count("virtualParameters", filter);
+  function onSortChange(sortAttrs: number[]): void {
+    const _sort: Record<string, number> = {};
+    for (const index of sortAttrs)
+      _sort[attributes[Math.abs(index) - 1].id] = Math.sign(index);
+    const ops: Record<string, string> = { sort: JSON.stringify(_sort) };
+    if (attrs.filter) ops["filter"] = attrs.filter.toString();
+    void navigate("/virtualParameters", ops);
+  }
 
-      const downloadUrl = getDownloadUrl(filter);
-
-      const attrs = {};
-      attrs["attributes"] = attributes;
-      attrs["data"] = virtualParameters.value;
-      attrs["total"] = count.value;
-      attrs["showMoreCallback"] = showMore;
-      attrs["sortAttributes"] = sortAttributes;
-      attrs["onSortChange"] = onSortChange;
-      attrs["downloadUrl"] = downloadUrl;
-      attrs["recordActionsCallback"] = (virtualParameter) => {
-        return [
-          m(
-            "a",
-            {
-              onclick: () => {
-                let cb: () => Children = null;
-                const comp = m(
-                  putFormComponent,
-                  Object.assign(
-                    {
-                      base: virtualParameter,
-                      actionHandler: (action, object) => {
-                        return new Promise<void>((resolve) => {
-                          putActionHandler(action, object, false)
-                            .then((errors) => {
-                              const errorList = errors
-                                ? Object.values(errors)
-                                : [];
-                              if (errorList.length) {
-                                for (const err of errorList)
-                                  notifications.push("error", err);
-                              } else {
-                                overlay.close(cb);
-                              }
-                              resolve();
-                            })
-                            .catch((err) => {
-                              notifications.push("error", err.message);
-                              resolve();
-                            });
+  // Record actions callback
+  const recordActionsCallback = (
+    virtualParameter: Record<string, unknown>,
+  ): Node[] => {
+    return [
+      button(
+        {
+          class: "text-cyan-700 hover:text-cyan-900 font-medium",
+          onclick: () => {
+            let cb: (() => Node) | null = null;
+            let formResult: PutFormResult | null = null;
+            cb = () => {
+              if (!formResult) {
+                formResult = createPutForm({
+                  base: virtualParameter,
+                  actionHandler: (action, object) => {
+                    return new Promise<void>((resolve) => {
+                      putActionHandler(
+                        action,
+                        object as Record<string, unknown>,
+                        false,
+                      )
+                        .then((errors) => {
+                          const errorList = errors ? Object.values(errors) : [];
+                          if (errorList.length) {
+                            for (const err of errorList)
+                              notifications.push("error", err);
+                          } else {
+                            overlay.close(cb!);
+                          }
+                          resolve();
+                        })
+                        .catch((err) => {
+                          notifications.push("error", err.message);
+                          resolve();
                         });
-                      },
-                    },
-                    formData,
-                  ),
-                );
-                cb = () => comp;
-                overlay.open(
-                  cb,
-                  () =>
-                    !comp.state["current"]["modified"] ||
-                    confirm("You have unsaved changes. Close anyway?"),
-                );
-              },
-            },
-            "Show",
-          ),
-        ];
-      };
-
-      if (window.authorizer.hasAccess("virtualParameters", 3)) {
-        attrs["actionsCallback"] = (selected: Set<string>): Children => {
-          return [
-            m(
-              "button.primary",
-              {
-                title: "Create new virtual parameter",
-                onclick: () => {
-                  let cb: () => Children = null;
-                  const comp = m(
-                    putFormComponent,
-                    Object.assign(
-                      {
-                        actionHandler: (action, object) => {
-                          return new Promise<void>((resolve) => {
-                            putActionHandler(action, object, true)
-                              .then((errors) => {
-                                const errorList = errors
-                                  ? Object.values(errors)
-                                  : [];
-                                if (errorList.length) {
-                                  for (const err of errorList)
-                                    notifications.push("error", err);
-                                } else {
-                                  overlay.close(cb);
-                                }
-                                resolve();
-                              })
-                              .catch((err) => {
-                                notifications.push("error", err.message);
-                                resolve();
-                              });
-                          });
-                        },
-                      },
-                      formData,
-                    ),
-                  );
-                  cb = () => comp;
-                  overlay.open(
-                    cb,
-                    () =>
-                      !comp.state["current"]["modified"] ||
-                      confirm("You have unsaved changes. Close anyway?"),
-                  );
-                },
-              },
-              "New",
-            ),
-            m(
-              "button.primary",
-              {
-                title: "Delete selected virtual parameters",
-                disabled: !selected.size,
-                onclick: (e) => {
-                  if (
-                    !confirm(
-                      `Deleting ${selected.size} virtual parameters. Are you sure?`,
-                    )
-                  )
-                    return;
-
-                  e.redraw = false;
-                  e.target.disabled = true;
-                  Promise.all(
-                    Array.from(selected).map((id) =>
-                      store.deleteResource("virtualParameters", id),
-                    ),
-                  )
-                    .then((res) => {
-                      notifications.push(
-                        "success",
-                        `${res.length} virtual parameters deleted`,
-                      );
-                      store.setTimestamp(Date.now());
-                    })
-                    .catch((err) => {
-                      notifications.push("error", err.message);
-                      store.setTimestamp(Date.now());
                     });
-                },
-              },
-              "Delete",
-            ),
-          ];
-        };
-      }
-
-      const filterAttrs = {
-        resource: "virtualParameters",
-        filter: vnode.attrs["filter"],
-        onChange: onFilterChanged,
-      };
-
-      return [
-        m("h1", "Listing virtual parameters"),
-        m(filterComponent, filterAttrs),
-        m(
-          "loading",
-          { queries: [virtualParameters, count] },
-          m(indexTableComponent, attrs),
-        ),
-      ];
-    },
+                  },
+                  ...formData,
+                });
+              }
+              return formResult.element;
+            };
+            overlay.open(
+              cb,
+              () =>
+                !formResult?.isModified() ||
+                confirm("You have unsaved changes. Close anyway?"),
+            );
+          },
+        },
+        "Show",
+      ),
+    ];
   };
-};
+
+  // Actions callback
+  let actionsCallback: ((selected: Set<string>) => Node[]) | undefined;
+  if (window.authorizer.hasAccess("virtualParameters", 3)) {
+    actionsCallback = (selected: Set<string>): Node[] => {
+      const newBtn = button(
+        {
+          class:
+            "px-4 py-2 border border-stone-300 shadow-xs text-sm font-medium rounded-md text-stone-700 bg-white hover:bg-stone-50 focus:outline-hidden focus:ring-2 focus:ring-offset-2 focus:ring-cyan-500 disabled:opacity-50 disabled:cursor-not-allowed",
+          title: "Create new virtual parameter",
+          onclick: () => {
+            let cb: (() => Node) | null = null;
+            let formResult: PutFormResult | null = null;
+            cb = () => {
+              if (!formResult) {
+                formResult = createPutForm({
+                  actionHandler: (action, object) => {
+                    return new Promise<void>((resolve) => {
+                      putActionHandler(
+                        action,
+                        object as Record<string, unknown>,
+                        true,
+                      )
+                        .then((errors) => {
+                          const errorList = errors ? Object.values(errors) : [];
+                          if (errorList.length) {
+                            for (const err of errorList)
+                              notifications.push("error", err);
+                          } else {
+                            overlay.close(cb!);
+                          }
+                          resolve();
+                        })
+                        .catch((err) => {
+                          notifications.push("error", err.message);
+                          resolve();
+                        });
+                    });
+                  },
+                  ...formData,
+                });
+              }
+              return formResult.element;
+            };
+            overlay.open(
+              cb,
+              () =>
+                !formResult?.isModified() ||
+                confirm("You have unsaved changes. Close anyway?"),
+            );
+          },
+        },
+        "New",
+      );
+
+      const deleteBtn = button(
+        {
+          class:
+            "px-4 py-2 border border-stone-300 shadow-xs text-sm font-medium rounded-md text-stone-700 bg-white hover:bg-stone-50 focus:outline-hidden focus:ring-2 focus:ring-offset-2 focus:ring-cyan-500 disabled:opacity-50 disabled:cursor-not-allowed",
+          title: "Delete selected virtual parameters",
+          disabled: !selected.size,
+          onclick: (e: MouseEvent) => {
+            if (
+              !confirm(
+                `Deleting ${selected.size} virtual parameters. Are you sure?`,
+              )
+            )
+              return;
+
+            const btn = e.currentTarget as HTMLButtonElement;
+            btn.disabled = true;
+            Promise.all(
+              Array.from(selected).map((id) =>
+                deleteResource("virtualParameters", id),
+              ),
+            )
+              .then((res) => {
+                notifications.push(
+                  "success",
+                  `${res.length} virtual parameters deleted`,
+                );
+                invalidate(Date.now());
+              })
+              .catch((err) => {
+                notifications.push("error", err.message);
+                invalidate(Date.now());
+              });
+          },
+        },
+        "Delete",
+      );
+
+      return [newBtn, deleteBtn];
+    };
+  }
+
+  // Build DOM once — table updates itself via signals
+  return div(
+    {},
+    h1(
+      { class: "text-xl font-medium text-stone-900 mb-5" },
+      "Listing virtual parameters",
+    ),
+    createFilter({
+      resource: "virtualParameters",
+      filter: attrs.filter,
+      onChange: onFilterChanged,
+    }),
+    createIndexTable({
+      attributes,
+      data: () => virtualParametersQuery().value as Record<string, unknown>[],
+      total: () => countQuery.get().value,
+      loading: () => virtualParametersQuery().loading,
+      showMoreCallback: () => showCount.set(showCount.get() + PAGE_SIZE),
+      sortAttributes,
+      onSortChange,
+      downloadUrl,
+      recordActionsCallback,
+      actionsCallback,
+    }),
+  );
+}

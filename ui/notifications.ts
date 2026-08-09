@@ -1,13 +1,13 @@
-import m from "mithril";
+import { StateSignal } from "./signals.ts";
 
-interface Notification {
+export interface Notification {
   type: string;
   message: string;
   timestamp: number;
   actions?: { [label: string]: () => void };
 }
 
-const notifications = new Set<Notification>();
+const notificationsSignal = new StateSignal<Notification[]>([]);
 
 export function push(
   type: string,
@@ -20,8 +20,7 @@ export function push(
     timestamp: Date.now(),
     actions: actions,
   };
-  notifications.add(n);
-  m.redraw();
+  notificationsSignal.update((list) => [...list, n]);
   if (!actions) {
     setTimeout(() => {
       dismiss(n);
@@ -32,10 +31,9 @@ export function push(
 }
 
 export function dismiss(n: Notification): void {
-  notifications.delete(n);
-  m.redraw();
+  notificationsSignal.update((list) => list.filter((x) => x !== n));
 }
 
-export function getNotifications(): Set<Notification> {
-  return notifications;
+export function getSignal(): StateSignal<Notification[]> {
+  return notificationsSignal;
 }

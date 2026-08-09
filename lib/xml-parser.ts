@@ -33,7 +33,7 @@ export interface Element {
   children: Element[];
 }
 
-export function parseXmlDeclaration(buffer: Buffer): Attribute[] {
+export function parseXmlDeclaration(buffer: Buffer): Attribute[] | null {
   const encodings: BufferEncoding[] = ["utf16le", "utf8", "latin1", "ascii"];
   for (const enc of encodings) {
     let str = buffer.toString(enc, 0, 150);
@@ -41,7 +41,7 @@ export function parseXmlDeclaration(buffer: Buffer): Attribute[] {
       str = str.slice(0, str.indexOf("?>"));
       try {
         return parseAttrs(str.slice(5));
-      } catch (err) {
+      } catch {
         // Ignore
       }
     }
@@ -146,7 +146,7 @@ export function decodeEntities(string: string): string {
 }
 
 export function encodeEntities(string: string): string {
-  const entities = {
+  const entities: Record<string, string> = {
     "&": "&amp;",
     '"': "&quot;",
     "'": "&apos;",
@@ -251,7 +251,7 @@ export function parseXml(string: string): Element {
 
           switch (secondChar) {
             case CHAR_SLASH:
-              e = stack.pop();
+              e = stack.pop()!;
               name =
                 wsIndex === 0
                   ? string.slice(state1Index + 2, i)

@@ -9,7 +9,7 @@ interface RequestOrigin {
   localPort: number;
   remoteAddress: string;
   remotePort: number;
-  host: string;
+  host?: string;
   encrypted: boolean;
 }
 
@@ -20,12 +20,12 @@ const cidrs: [IPv4 | IPv6, number][] = [];
 for (const str of FORWARDED_HEADER.split(",").map((s) => s.trim())) {
   try {
     cidrs.push(parseCIDR(str));
-  } catch (err) {
+  } catch {
     // Not a valid CIDR format, try parsing as IP
     try {
       const ip = parse(str);
       cidrs.push([ip, ip.toByteArray().length * 8]);
-    } catch (err) {
+    } catch {
       // Not a valid IP either, ignore
     }
   }
@@ -36,7 +36,7 @@ function parseForwardedHeader(str: string): { [name: string]: string } {
   const res: { [name: string]: string } = {};
   let keyIdx = 0;
   let valueIdx = -1;
-  let key: string;
+  let key = "";
   for (let i = 0; i < str.length; ++i) {
     const char = str.charCodeAt(i);
     if (char === 61 /* = */) {

@@ -1,6 +1,6 @@
 import * as vm from "node:vm";
 import { IncomingMessage, ServerResponse } from "node:http";
-import { Collection, ObjectId } from "mongodb";
+import { ObjectId } from "mongodb";
 import { getRevision, getConfig } from "./ui/local-cache.ts";
 import { filesBucket, collections } from "./db/db.ts";
 import { optimizeProjection } from "./db/util.ts";
@@ -14,6 +14,7 @@ import { flattenDevice } from "./ui/db.ts";
 import { getRequestOrigin } from "./forwarded.ts";
 import { acquireLock, releaseLock } from "./lock.ts";
 import { ResourceLockedError } from "./common/errors.ts";
+import Expression from "./common/expression.ts";
 
 const DEVICE_TASKS_REGEX = /^\/devices\/([a-zA-Z0-9\-_%]+)\/tasks\/?$/;
 const TASKS_REGEX = /^\/tasks\/([a-zA-Z0-9\-_%]+)(\/[a-zA-Z_]*)?$/;
@@ -52,11 +53,11 @@ export async function listener(
 
   const origin = getRequestOrigin(request);
   const url = new URL(
-    request.url,
+    request.url!,
     (origin.encrypted ? "https://" : "http://") + origin.host,
   );
 
-  const body = await getBody(request).catch(() => null);
+  const body = await getBody(request).catch((): null => null);
   // Ignore incomplete requests
   if (body == null) return;
 
@@ -75,13 +76,15 @@ async function handler(
   url: URL,
   body: Buffer,
 ): Promise<void> {
-  if (PRESETS_REGEX.test(url.pathname)) {
-    const presetName = decodeURIComponent(PRESETS_REGEX.exec(url.pathname)[1]);
+  let match: RegExpExecArray | null;
+  if ((match = PRESETS_REGEX.exec(url.pathname))) {
+    const presetName = decodeURIComponent(match[1]);
     if (request.method === "PUT") {
       let preset;
       try {
         preset = JSON.parse(body.toString());
       } catch (err) {
+        if (!(err instanceof Error)) throw err;
         response.writeHead(400);
         response.end(`${err.name}: ${err.message}`);
         return;
@@ -102,13 +105,14 @@ async function handler(
       response.writeHead(405, { Allow: "PUT, DELETE" });
       response.end("405 Method Not Allowed");
     }
-  } else if (OBJECTS_REGEX.test(url.pathname)) {
-    const objectName = decodeURIComponent(OBJECTS_REGEX.exec(url.pathname)[1]);
+  } else if ((match = OBJECTS_REGEX.exec(url.pathname))) {
+    const objectName = decodeURIComponent(match[1]);
     if (request.method === "PUT") {
       let object;
       try {
         object = JSON.parse(body.toString());
       } catch (err) {
+        if (!(err instanceof Error)) throw err;
         response.writeHead(400);
         response.end(`${err.name}: ${err.message}`);
         return;
@@ -129,10 +133,8 @@ async function handler(
       response.writeHead(405, { Allow: "PUT, DELETE" });
       response.end("405 Method Not Allowed");
     }
-  } else if (PROVISIONS_REGEX.test(url.pathname)) {
-    const provisionName = decodeURIComponent(
-      PROVISIONS_REGEX.exec(url.pathname)[1],
-    );
+  } else if ((match = PROVISIONS_REGEX.exec(url.pathname))) {
+    const provisionName = decodeURIComponent(match[1]);
     if (request.method === "PUT") {
       const object = {
         _id: provisionName,
@@ -142,6 +144,7 @@ async function handler(
       try {
         new vm.Script(`"use strict";(function(){\n${object.script}\n})();`);
       } catch (err) {
+        if (!(err instanceof Error)) throw err;
         response.writeHead(400);
         response.end(`${err.name}: ${err.message}`);
         return;
@@ -162,10 +165,8 @@ async function handler(
       response.writeHead(405, { Allow: "PUT, DELETE" });
       response.end("405 Method Not Allowed");
     }
-  } else if (VIRTUAL_PARAMETERS_REGEX.test(url.pathname)) {
-    const virtualParameterName = decodeURIComponent(
-      VIRTUAL_PARAMETERS_REGEX.exec(url.pathname)[1],
-    );
+  } else if ((match = VIRTUAL_PARAMETERS_REGEX.exec(url.pathname))) {
+    const virtualParameterName = decodeURIComponent(match[1]);
     if (request.method === "PUT") {
       const object = {
         _id: virtualParameterName,
@@ -175,6 +176,7 @@ async function handler(
       try {
         new vm.Script(`"use strict";(function(){\n${object.script}\n})();`);
       } catch (err) {
+        if (!(err instanceof Error)) throw err;
         response.writeHead(400);
         response.end(`${err.name}: ${err.message}`);
         return;
@@ -199,10 +201,9 @@ async function handler(
       response.writeHead(405, { Allow: "PUT, DELETE" });
       response.end("405 Method Not Allowed");
     }
-  } else if (TAGS_REGEX.test(url.pathname)) {
-    const r = TAGS_REGEX.exec(url.pathname);
-    const deviceId = decodeURIComponent(r[1]);
-    const tag = decodeURIComponent(r[2]);
+  } else if ((match = TAGS_REGEX.exec(url.pathname))) {
+    const deviceId = decodeURIComponent(match[1]);
+    const tag = decodeURIComponent(match[2]);
     if (request.method === "POST") {
       const updateRes = await collections.devices.updateOne(
         { _id: deviceId },
@@ -235,9 +236,9 @@ async function handler(
       response.writeHead(405, { Allow: "POST, DELETE" });
       response.end("405 Method Not Allowed");
     }
-  } else if (FAULTS_REGEX.test(url.pathname)) {
+  } else if ((match = FAULTS_REGEX.exec(url.pathname))) {
     if (request.method === "DELETE") {
-      const faultId = decodeURIComponent(FAULTS_REGEX.exec(url.pathname)[1]);
+      const faultId = decodeURIComponent(match[1]);
       try {
         await apiFunctions.deleteFault(faultId);
       } catch (err) {
@@ -255,11 +256,9 @@ async function handler(
       response.writeHead(405, { Allow: "DELETE" });
       response.end("405 Method Not Allowed");
     }
-  } else if (DEVICE_TASKS_REGEX.test(url.pathname)) {
+  } else if ((match = DEVICE_TASKS_REGEX.exec(url.pathname))) {
     if (request.method === "POST") {
-      const deviceId = decodeURIComponent(
-        DEVICE_TASKS_REGEX.exec(url.pathname)[1],
-      );
+      const deviceId = decodeURIComponent(match[1]);
 
       const conReq = url.searchParams.has("connection_request");
       let task;
@@ -268,6 +267,7 @@ async function handler(
           task = JSON.parse(body.toString());
           task.device = deviceId;
         } catch (err) {
+          if (!(err instanceof Error)) throw err;
           response.writeHead(400);
           response.end(`${err.name}: ${err.message}`);
           return;
@@ -308,7 +308,7 @@ async function handler(
         return;
       }
 
-      const socketTimeout: number = request.socket.timeout;
+      const socketTimeout = request.socket.timeout ?? 0;
 
       // Extend socket timeout while waiting for session
       if (socketTimeout) request.socket.setTimeout(300000);
@@ -349,34 +349,35 @@ async function handler(
       const lastInform = (dev["_lastInform"] as Date).getTime();
       const device = flattenDevice(dev);
 
+      const configCallback = (e: Expression): Expression.Literal => {
+        if (e instanceof Expression.Literal) return e;
+        else if (e instanceof Expression.Parameter) {
+          const p = device[e.path.toString()];
+          if (p != null) return new Expression.Literal(p);
+        } else if (e instanceof Expression.FunctionCall) {
+          if (e.name === "NOW") return new Expression.Literal(Date.now());
+          if (e.name === "REMOTE_ADDRESS") {
+            for (const root of ["InternetGatewayDevice", "Device"]) {
+              const p = device[`${root}.ManagementServer.ConnectionRequestURL`];
+              if (p != null)
+                return new Expression.Literal(new URL(p as string).hostname);
+            }
+          }
+        }
+        return new Expression.Literal(null);
+      };
+
       let onlineThreshold: number;
       if (url.searchParams.has("timeout")) {
-        onlineThreshold = parseInt(url.searchParams.get("timeout"));
+        onlineThreshold = parseInt(url.searchParams.get("timeout") as string);
       } else {
         const revision = await getRevision();
         onlineThreshold = getConfig(
           revision,
           "cwmp.deviceOnlineThreshold",
-          {},
-          Date.now(),
-          (exp) => {
-            if (!Array.isArray(exp)) return exp;
-            if (exp[0] === "PARAM") {
-              const p = device[exp[1]];
-              if (p?.value) return p.value[0];
-            } else if (exp[0] === "FUNC") {
-              if (exp[1] === "REMOTE_ADDRESS") {
-                for (const root of ["InternetGatewayDevice", "Device"]) {
-                  const p =
-                    device[`${root}.ManagementServer.ConnectionRequestURL`];
-                  if (p?.value) return new URL(p.value[0] as string).hostname;
-                }
-                return null;
-              }
-            }
-            return exp;
-          },
-        ) as number;
+          4000,
+          configCallback,
+        );
       }
 
       let status = await apiFunctions.connectionRequest(deviceId, device);
@@ -418,10 +419,9 @@ async function handler(
       response.writeHead(405, { Allow: "POST" });
       response.end("405 Method Not Allowed");
     }
-  } else if (TASKS_REGEX.test(url.pathname)) {
-    const r = TASKS_REGEX.exec(url.pathname);
-    const taskId = decodeURIComponent(r[1]);
-    const action = r[2];
+  } else if ((match = TASKS_REGEX.exec(url.pathname))) {
+    const taskId = decodeURIComponent(match[1]);
+    const action = match[2];
     if (!action || action === "/") {
       if (request.method === "DELETE") {
         const task = await collections.tasks.findOne(
@@ -465,6 +465,12 @@ async function handler(
           { projection: { device: 1 } },
         );
 
+        if (!task) {
+          response.writeHead(404);
+          response.end("Task not found");
+          return;
+        }
+
         const deviceId = task.device;
         const token = await acquireLock(`cwmp_session_${deviceId}`, 5000);
         if (!token) {
@@ -490,8 +496,8 @@ async function handler(
       response.writeHead(404);
       response.end();
     }
-  } else if (FILES_REGEX.test(url.pathname)) {
-    const filename = decodeURIComponent(FILES_REGEX.exec(url.pathname)[1]);
+  } else if ((match = FILES_REGEX.exec(url.pathname))) {
+    const filename = decodeURIComponent(match[1]);
     if (request.method === "PUT") {
       const metadata = {
         fileType: request.headers.filetype,
@@ -501,7 +507,7 @@ async function handler(
       };
       try {
         await filesBucket.delete(filename as unknown as ObjectId);
-      } catch (err) {
+      } catch {
         // Ignore error if file doesn't exist
       }
 
@@ -526,6 +532,7 @@ async function handler(
       try {
         await filesBucket.delete(filename as unknown as ObjectId);
       } catch (err) {
+        if (!(err instanceof Error)) throw err;
         if (err.message.startsWith("FileNotFound")) {
           response.writeHead(404);
           response.end("404 Not Found");
@@ -539,8 +546,8 @@ async function handler(
       response.writeHead(405, { Allow: "PUT, DELETE" });
       response.end("405 Method Not Allowed");
     }
-  } else if (PING_REGEX.test(url.pathname)) {
-    const host = decodeURIComponent(PING_REGEX.exec(url.pathname)[1]);
+  } else if ((match = PING_REGEX.exec(url.pathname))) {
+    const host = decodeURIComponent(match[1]);
     return new Promise((resolve) => {
       ping(host, (err, res, stdout) => {
         if (err) {
@@ -562,16 +569,14 @@ async function handler(
         resolve();
       });
     });
-  } else if (DELETE_DEVICE_REGEX.test(url.pathname)) {
+  } else if ((match = DELETE_DEVICE_REGEX.exec(url.pathname))) {
     if (request.method !== "DELETE") {
       response.writeHead(405, { Allow: "DELETE" });
       response.end("405 Method Not Allowed");
       return;
     }
 
-    const deviceId = decodeURIComponent(
-      DELETE_DEVICE_REGEX.exec(url.pathname)[1],
-    );
+    const deviceId = decodeURIComponent(match[1]);
 
     try {
       await apiFunctions.deleteDevice(deviceId);
@@ -586,8 +591,8 @@ async function handler(
 
     response.writeHead(200);
     response.end();
-  } else if (QUERY_REGEX.test(url.pathname)) {
-    let collectionName = QUERY_REGEX.exec(url.pathname)[1];
+  } else if ((match = QUERY_REGEX.exec(url.pathname))) {
+    let collectionName = match[1];
 
     // Convert to camel case
     let i = collectionName.indexOf("_");
@@ -605,7 +610,7 @@ async function handler(
       return;
     }
 
-    const collection = collections[collectionName] as Collection<unknown>;
+    const collection = collections[collectionName as keyof typeof collections];
     if (!collection) {
       response.writeHead(404);
       response.end("404 Not Found");
@@ -617,6 +622,7 @@ async function handler(
       try {
         q = JSON.parse(url.searchParams.get("query") as string);
       } catch (err) {
+        if (!(err instanceof Error)) throw err;
         response.writeHead(400);
         response.end(`${err.name}: ${err.message}`);
         return;
@@ -641,7 +647,7 @@ async function handler(
         });
     }
 
-    let projection = null;
+    let projection: Record<string, 1> | undefined;
     if (url.searchParams.has("projection")) {
       projection = {};
       for (const p of (url.searchParams.get("projection") as string).split(","))
@@ -656,18 +662,19 @@ async function handler(
       try {
         s = JSON.parse(url.searchParams.get("sort") as string);
       } catch (err) {
+        if (!(err instanceof Error)) throw err;
         response.writeHead(400);
         response.end(`${err.name}: ${err.message}`);
         return;
       }
-      const sort = {};
+      const sort: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(s)) {
         if (k[k.lastIndexOf(".") + 1] !== "_" && collectionName === "devices")
           sort[`${k}._value`] = v;
         else sort[k] = v;
       }
 
-      cur.sort(sort);
+      cur.sort(sort as Record<string, 1 | -1>);
     }
 
     const total = await collection.countDocuments(q);

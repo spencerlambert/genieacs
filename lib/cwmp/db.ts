@@ -7,8 +7,7 @@ import {
   Task,
   Operation,
 } from "../types.ts";
-import Path from "../common/path.ts";
-import { collections } from "../db/db.ts";
+import { collections, uploadsBucket } from "../db/db.ts";
 import { optimizeProjection } from "../db/util.ts";
 import * as MongoTypes from "../db/types.ts";
 
@@ -23,25 +22,23 @@ function compareAccessLists(list1: string[], list2: string[]): boolean {
 export async function fetchDevice(
   id: string,
   timestamp: number,
-): Promise<[Path, number, Attributes?][]> {
-  const res: [Path, number, Attributes?][] = [
+): Promise<[string, number, Attributes?][] | null> {
+  const res: [string, number, Attributes?][] = [
+    ["Events", timestamp, { object: [timestamp, 1], writable: [timestamp, 0] }],
     [
-      Path.parse("Events"),
-      timestamp,
-      { object: [timestamp, 1], writable: [timestamp, 0] },
-    ],
-    [
-      Path.parse("DeviceID"),
+      "DeviceID",
       timestamp,
       { object: [timestamp, 1], writable: [timestamp, 0] },
     ],
   ];
 
-  const device = await collections.devices.findOne({ _id: id });
+  const device = (await collections.devices.findOne({
+    _id: id,
+  })) as Record<string, any>;
   if (!device) return null;
 
   function storeParams(
-    obj,
+    obj: any,
     path: string,
     pathLength: number,
     ts: number,
@@ -77,8 +74,8 @@ export async function fetchDevice(
       attrs.accessList = [obj["_attributesTimestamp"] || 1, obj["_accessList"]];
 
     try {
-      res.push([Path.parse(path), t, attrs]);
-    } catch (err) {
+      res.push([path, t, attrs]);
+    } catch {
       // The path parser is now more strict so we might be in a situation where
       // the database contains invalid paths from before this change So here we
       // encode the invalid characters.
@@ -86,7 +83,7 @@ export async function fetchDevice(
       splits[splits.length - 1] =
         encodeTag(splits[splits.length - 1]) + INVALID_PATH_SUFFIX;
       path = splits.join(".");
-      res.push([Path.parse(path), t, attrs]);
+      res.push([path, t, attrs]);
       return;
     }
 
@@ -98,17 +95,17 @@ export async function fetchDevice(
     }
 
     if (obj["_object"] && obj["_timestamp"])
-      res.push([Path.parse(path + ".*"), obj["_timestamp"]]);
+      res.push([path + ".*", obj["_timestamp"]]);
   }
 
   const ts: number = +device["_timestamp"] || 0;
-  if (ts) res.push([Path.parse("*"), ts]);
+  if (ts) res.push(["*", ts]);
 
   for (const [k, v] of Object.entries(device)) {
     switch (k) {
       case "_lastInform":
         res.push([
-          Path.parse("Events.Inform"),
+          "Events.Inform",
           +v,
           {
             object: [+v, 0],
@@ -119,7 +116,7 @@ export async function fetchDevice(
         break;
       case "_lastBoot":
         res.push([
-          Path.parse("Events.1_BOOT"),
+          "Events.1_BOOT",
           +v,
           {
             object: [+v, 0],
@@ -130,7 +127,7 @@ export async function fetchDevice(
         break;
       case "_lastBootstrap":
         res.push([
-          Path.parse("Events.0_BOOTSTRAP"),
+          "Events.0_BOOTSTRAP",
           +v,
           {
             object: [+v, 0],
@@ -142,7 +139,7 @@ export async function fetchDevice(
       case "_registered":
         // Use current timestamp for registered event attribute timestamps
         res.push([
-          Path.parse("Events.Registered"),
+          "Events.Registered",
           timestamp,
           {
             object: [timestamp, 0],
@@ -153,7 +150,7 @@ export async function fetchDevice(
         break;
       case "_id":
         res.push([
-          Path.parse("DeviceID.ID"),
+          "DeviceID.ID",
           timestamp,
           {
             object: [timestamp, 0],
@@ -165,7 +162,7 @@ export async function fetchDevice(
       case "_tags":
         if ((v as string[]).length) {
           res.push([
-            Path.parse("Tags"),
+            "Tags",
             timestamp,
             { object: [timestamp, 1], writable: [timestamp, 0] },
           ]);
@@ -173,7 +170,7 @@ export async function fetchDevice(
 
         for (const t of v as string[]) {
           res.push([
-            Path.parse("Tags." + encodeTag(t)),
+            "Tags." + encodeTag(t),
             timestamp,
             {
               object: [timestamp, 0],
@@ -186,7 +183,7 @@ export async function fetchDevice(
       case "_deviceId":
         if (v["_Manufacturer"] != null) {
           res.push([
-            Path.parse("DeviceID.Manufacturer"),
+            "DeviceID.Manufacturer",
             timestamp,
             {
               object: [timestamp, 0],
@@ -198,7 +195,7 @@ export async function fetchDevice(
 
         if (v["_OUI"] != null) {
           res.push([
-            Path.parse("DeviceID.OUI"),
+            "DeviceID.OUI",
             timestamp,
             {
               object: [timestamp, 0],
@@ -210,7 +207,7 @@ export async function fetchDevice(
 
         if (v["_ProductClass"] != null) {
           res.push([
-            Path.parse("DeviceID.ProductClass"),
+            "DeviceID.ProductClass",
             timestamp,
             {
               object: [timestamp, 0],
@@ -222,7 +219,7 @@ export async function fetchDevice(
 
         if (v["_SerialNumber"] != null) {
           res.push([
-            Path.parse("DeviceID.SerialNumber"),
+            "DeviceID.SerialNumber",
             timestamp,
             {
               object: [timestamp, 0],
@@ -245,7 +242,12 @@ export async function saveDevice(
   isNew: boolean,
   sessionTimestamp: number,
 ): Promise<void> {
-  const update = { $set: {}, $unset: {}, $addToSet: {}, $pull: {} };
+  const update: Record<string, Record<string, any>> = {
+    $set: {},
+    $unset: {},
+    $addToSet: {},
+    $pull: {},
+  };
 
   for (const diff of deviceData.timestamps.diff()) {
     if (diff[0].wildcard !== 1 << (diff[0].length - 1)) continue;
@@ -257,14 +259,14 @@ export async function saveDevice(
     )
       continue;
 
-    const parent = deviceData.paths.get(diff[0].slice(0, -1));
+    const parent = deviceData.paths.get(diff[0].slice(0, -1).toString());
 
     // Param timestamps may be greater than session timestamp to track revisions
     if (diff[2] > sessionTimestamp) diff[2] = sessionTimestamp;
 
     if (diff[2] == null && diff[1] != null) {
       update["$unset"][
-        parent.length ? parent.toString() + "._timestamp" : "_timestamp"
+        parent!.length ? parent!.toString() + "._timestamp" : "_timestamp"
       ] = 1;
     } else {
       if (parent && (!parent.length || deviceData.attributes.has(parent))) {
@@ -312,7 +314,7 @@ export async function saveDevice(
                 update["$unset"]["_registered"] = 1;
             }
           } else {
-            const t = new Date(diff[2].value[1][0] as number);
+            const t = new Date(diff[2].value![1][0] as number);
             switch (path.segments[1]) {
               case "Inform":
                 update["$set"]["_lastInform"] = t;
@@ -332,7 +334,7 @@ export async function saveDevice(
         break;
       case "DeviceID":
         if (value2 !== value1) {
-          const v = diff[2].value[1][0];
+          const v = diff[2].value![1][0];
           switch (path.segments[1]) {
             case "ID":
               update["$set"]["_id"] = v;
@@ -373,6 +375,16 @@ export async function saveDevice(
 
         break;
       default:
+        if (
+          diff[0].segments[0] === "Uploads" &&
+          diff[0].segments[2] === "LastFileName" &&
+          value1 &&
+          value1 !== value2
+        ) {
+          // Ignore error due to missing files
+          await uploadsBucket.delete(value1 as any).catch(() => {});
+        }
+
         if (!diff[2]) {
           let pathStr = path.toString();
           // Paths with that suffix are encoded and need to be decoded
@@ -390,12 +402,12 @@ export async function saveDevice(
           continue;
         }
 
-        for (const attrName of Object.keys(diff[2])) {
+        for (const attrName of Object.keys(diff[2]) as (keyof Attributes)[]) {
           // Param timestamps may be greater than session timestamp to track revisions
-          if (diff[2][attrName][0] > sessionTimestamp)
-            diff[2][attrName][0] = sessionTimestamp;
+          if (diff[2][attrName]![0] > sessionTimestamp)
+            diff[2][attrName]![0] = sessionTimestamp;
 
-          if (diff[2][attrName][1] != null) {
+          if (diff[2][attrName]![1] != null) {
             switch (attrName) {
               case "value":
                 if (value2 !== value1) {
@@ -416,7 +428,7 @@ export async function saveDevice(
 
                 if (valueTimestamp2 !== valueTimestamp1) {
                   update["$set"][path.toString() + "._timestamp"] = new Date(
-                    valueTimestamp2,
+                    valueTimestamp2!,
                   );
                 }
 
@@ -452,7 +464,7 @@ export async function saveDevice(
 
                 if (attributesTimestamp2 !== attributesTimestamp1) {
                   update["$set"][path.toString() + "._attributesTimestamp"] =
-                    new Date(attributesTimestamp2);
+                    new Date(attributesTimestamp2!);
                 }
 
                 break;
@@ -460,7 +472,7 @@ export async function saveDevice(
                 if (
                   !diff[1] ||
                   !diff[1].accessList ||
-                  !compareAccessLists(accessList2, accessList1)
+                  !compareAccessLists(accessList2!, accessList1!)
                 ) {
                   update["$set"][
                     path.length
@@ -471,16 +483,16 @@ export async function saveDevice(
 
                 if (attributesTimestamp2 !== attributesTimestamp1) {
                   update["$set"][path.toString() + "._attributesTimestamp"] =
-                    new Date(attributesTimestamp2);
+                    new Date(attributesTimestamp2!);
                 }
             }
           }
         }
 
         if (diff[1]) {
-          for (const attrName of Object.keys(diff[1])) {
+          for (const attrName of Object.keys(diff[1]) as (keyof Attributes)[]) {
             if (
-              diff[1][attrName][1] != null &&
+              diff[1][attrName]![1] != null &&
               diff[2]?.[attrName]?.[1] == null
             ) {
               const p = path.length ? path.toString() + "." : "";
@@ -511,7 +523,10 @@ export async function saveDevice(
     if (update["$set"][k] != null) delete update["$unset"][k];
 
   // Remove empty keys
-  for (const [k, v] of Object.entries(update)) {
+  for (const [k, v] of Object.entries(update) as [
+    keyof typeof update,
+    Record<string, any>,
+  ][]) {
     if (k === "$addToSet") {
       for (const [kk, vv] of Object.entries(v))
         if (!vv["$each"].length) delete v[kk];
@@ -611,7 +626,7 @@ export async function getDueTasks(
   const tasks = [] as Task[];
 
   for await (const t of cur) {
-    if (+t.timestamp >= timestamp) return [tasks, +t.timestamp];
+    if (t.timestamp && +t.timestamp >= timestamp) return [tasks, +t.timestamp];
     const task: Task = {
       _id: t._id.toString(),
       name: t.name,
@@ -641,28 +656,33 @@ export async function getDueTasks(
       ...(t.name === "provisions" && {
         provisions: t.provisions,
       }),
+      ...(t.name === "upload" && {
+        fileType: t.fileType,
+        fileName: t.fileName,
+      }),
     };
 
     tasks.push(task);
 
     // For API compatibility
-    if (task.name === "download" && t["file"]) {
+    const tFile = (t as Record<string, any>)["file"];
+    if (task.name === "download" && tFile) {
       let q;
-      if (ObjectId.isValid(t["file"]))
-        q = { _id: { $in: [t["file"], new ObjectId(t["file"])] } };
-      else q = { _id: t["file"] };
+      if (ObjectId.isValid(tFile))
+        q = { _id: { $in: [tFile, new ObjectId(tFile)] } };
+      else q = { _id: tFile };
 
       const res = await collections.files.find(q).toArray();
 
       if (res[0]) {
-        if (!task.fileType) task.fileType = res[0].metadata.fileType;
+        if (!task.fileType) task.fileType = res[0].metadata?.fileType;
 
         if (!task.fileName)
           task.fileName = res[0].filename || res[0]._id.toString();
       }
     }
   }
-  return [tasks, null];
+  return [tasks, 0];
 }
 
 export async function clearTasks(
@@ -686,7 +706,7 @@ export async function getOperations(
     const commandKey = r._id.slice(deviceId.length + 1);
     // Workaround for a bug in v1.2.1 where operation object is saved without deserialization
     if (typeof r.provisions !== "string") {
-      delete r._id;
+      delete (r as Record<string, unknown>)._id;
       operations[commandKey] = r as unknown as Operation;
       continue;
     }
@@ -697,7 +717,7 @@ export async function getOperations(
         typeof r.channels === "string" ? JSON.parse(r.channels) : r.channels,
       retries: JSON.parse(r.retries),
       provisions: JSON.parse(r.provisions),
-      ...(r.args && { args: JSON.parse(r.args) }),
+      args: r.args ? JSON.parse(r.args) : {},
     };
     operations[commandKey] = operation;
   }

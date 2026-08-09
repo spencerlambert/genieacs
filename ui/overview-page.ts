@@ -1,71 +1,108 @@
-import { ClosureComponent, Component } from "mithril";
-import { m } from "./components.ts";
-import config from "./config.ts";
-import * as store from "./store.ts";
-import pieChartComponent from "./pie-chart-component.ts";
+import { overview, rawConf } from "./config.ts";
+import { count as reactiveCount } from "./reactive-store.ts";
+import Expression from "../lib/common/expression.ts";
+import { renderView } from "./views.ts";
+import { createPieChart } from "./pie-chart-component.ts";
+import { div, h1, h2 } from "./dom.ts";
 
-const GROUPS = config.ui.overview.groups || {};
-const CHARTS = {};
-for (const group of Object.values(GROUPS)) {
-  for (const chartName of Object.values(group["charts"]) as string[])
-    CHARTS[chartName] = config.ui.overview.charts[chartName];
+const GROUPS = overview.groups;
+const CHARTS: typeof overview.charts = {};
+for (const group of GROUPS) {
+  for (const chartName of group.charts)
+    CHARTS[chartName] = overview.charts[chartName];
 }
 
-function queryCharts(charts: Record<string, unknown>): Record<string, unknown> {
-  charts = Object.assign({}, charts);
-  for (let [chartName, chart] of Object.entries(charts)) {
-    charts[chartName] = chart = Object.assign({}, chart);
-    chart["slices"] = Object.assign({}, chart["slices"]);
-    for (let [sliceName, slice] of Object.entries(chart["slices"])) {
-      const filter = slice["filter"];
-      chart["slices"][sliceName] = slice = Object.assign({}, slice);
-      slice["count"] = store.count("devices", filter);
-    }
-  }
-  return charts;
-}
+export type Attrs = Record<string, never>;
 
-export function init(): Promise<Record<string, unknown>> {
+export function init(): Promise<Attrs> {
   if (!window.authorizer.hasAccess("devices", 1)) {
     return Promise.reject(
       new Error("You are not authorized to view this page"),
     );
   }
 
-  return Promise.resolve({ charts: queryCharts(CHARTS) });
+  return Promise.resolve({} as Attrs);
 }
 
-export const component: ClosureComponent = (): Component => {
-  return {
-    view: (vnode) => {
-      document.title = "Overview - GenieACS";
-      const children = [];
-      for (const group of Object.values(GROUPS)) {
-        if (group["label"])
-          children.push(
-            m("h1", store.evaluateExpression(group["label"], null)),
-          );
+export function createPage(): HTMLElement {
+  document.title = "Overview - GenieACS";
 
-        const groupChildren = [];
-        for (const chartName of Object.values(group["charts"]) as string[]) {
-          const chart = vnode.attrs["charts"][chartName];
-          const chartChildren = [];
-          if (chart.label)
-            chartChildren.push(
-              m("h2", store.evaluateExpression(chart.label, null)),
-            );
+  // Custom view mode
+  if (
+    rawConf["overview"] instanceof Expression.Literal &&
+    typeof rawConf["overview"].value === "string"
+  ) {
+    const viewName = (rawConf["overview"] as Expression.Literal)
+      .value as string;
+    return div({}, renderView(viewName, {}));
+  }
 
-          const attrs = {};
-          attrs["chart"] = chart;
-          chartChildren.push(m(pieChartComponent, attrs));
+  // Create reactive count signals for all chart slices
+  const sliceCountSignals = new Map<string, ReturnType<typeof reactiveCount>>();
+  for (const [chartName, chart] of Object.entries(CHARTS)) {
+    for (let i = 0; i < chart.slices.length; i++) {
+      const slice = chart.slices[i];
+      sliceCountSignals.set(
+        `${chartName}:${i}`,
+        reactiveCount("devices", slice.filter),
+      );
+    }
+  }
 
-          groupChildren.push(m(".overview-chart", chartChildren));
-        }
+  // Reactive child: reads all count signals, rebuilds charts when data arrives
+  return div({}, () => {
+    const groupElements: Node[] = [];
 
-        children.push(m(".overview-chart-group", groupChildren));
+    for (const group of GROUPS) {
+      if (group.label) {
+        groupElements.push(
+          h1({ class: "text-xl font-medium text-stone-900 mb-5" }, group.label),
+        );
       }
 
-      return children;
-    },
-  };
-};
+      const chartElements: Node[] = [];
+      for (const chartName of group.charts) {
+        const chartConfig = CHARTS[chartName];
+
+        const slices = chartConfig.slices.map((s, i) => {
+          const signal = sliceCountSignals.get(`${chartName}:${i}`);
+          const state = signal!.get();
+          return {
+            label: s.label,
+            filter: s.filter,
+            color: s.color,
+            count: state.value as number | null,
+            loading: state.loading,
+          };
+        });
+
+        chartElements.push(
+          div(
+            { class: "p-4 bg-white shadow-sm rounded-lg sm:p-6 sm:px-8" },
+            ...(chartConfig.label
+              ? [
+                  h2(
+                    {
+                      class:
+                        "text-lg font-semibold text-stone-700 truncate mb-5 text-center",
+                    },
+                    chartConfig.label,
+                  ),
+                ]
+              : []),
+            createPieChart({ label: chartConfig.label, slices }),
+          ),
+        );
+      }
+
+      groupElements.push(
+        div(
+          { class: "flex justify-center mt-5 mb-10 gap-x-10" },
+          ...chartElements,
+        ),
+      );
+    }
+
+    return div({}, ...groupElements);
+  });
+}

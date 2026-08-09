@@ -15,17 +15,29 @@ import {
   SoapMessage,
   TransferCompleteRequest,
   AcsRequest,
+  type GetParameterNames,
   type GetParameterNamesResponse,
+  type GetParameterValues,
   type GetParameterValuesResponse,
+  type GetParameterAttributes,
   type GetParameterAttributesResponse,
+  type SetParameterValues,
   type SetParameterValuesResponse,
+  type SetParameterAttributes,
   type SetParameterAttributesResponse,
+  type AddObject,
   type AddObjectResponse,
   type DeleteObject,
   type DeleteObjectResponse,
+  type Reboot,
   type RebootResponse,
+  type FactoryReset,
   type FactoryResetResponse,
+  type Download,
   type DownloadResponse,
+  type Upload,
+  type UploadResponse,
+  type GetRPCMethodsResponse as GetRPCMethodsResponseType,
   GetRPCMethodsRequest,
   RequestDownloadRequest,
   AcsResponse,
@@ -76,7 +88,17 @@ let warnings: Record<string, unknown>[];
 
 const memoizedParseAttrs = memoize(parseAttrs);
 
-function parseBool(v: string): boolean {
+function getChild(xml: Element, name: string): Element | undefined {
+  return xml.children.find((c) => c.localName === name);
+}
+
+function requireChild(xml: Element, name: string): Element {
+  const c = getChild(xml, name);
+  if (!c) throw new Error(`Missing ${name} element`);
+  return c;
+}
+
+function parseBool(v: string): boolean | null {
   if (v === "true" || v === "1") return true;
   if (v === "false" || v === "0") return false;
   return null;
@@ -85,50 +107,50 @@ function parseBool(v: string): boolean {
 function event(xml: Element): string[] {
   return xml.children
     .filter((n) => n.localName === "EventStruct")
-    .map((c) => c.children.find((n) => n.localName === "EventCode").text);
+    .map((c) => requireChild(c, "EventCode").text);
 }
 
 function parameterInfoList(xml: Element): [Path, boolean, boolean][] {
-  return xml.children
-    .map<[Path, boolean, boolean]>((e) => {
-      if (e.localName !== "ParameterInfoStruct") return null;
-      let param: string, value: string;
-      for (const c of e.children) {
-        switch (c.localName) {
-          case "Name":
-            param = c.text;
-            break;
-          case "Writable":
-            value = c.text;
-            break;
-        }
+  const result: [Path, boolean, boolean][] = [];
+  for (const e of xml.children) {
+    if (e.localName !== "ParameterInfoStruct") continue;
+    let nameEl: Element | undefined;
+    let writableEl: Element | undefined;
+    for (const c of e.children) {
+      switch (c.localName) {
+        case "Name":
+          nameEl = c;
+          break;
+        case "Writable":
+          writableEl = c;
+          break;
       }
+    }
 
-      let parsed: boolean = parseBool(value);
+    let parsed = writableEl ? parseBool(writableEl.text) : null;
+    if (parsed == null) {
+      warnings.push({
+        message: "Missing or invalid XML node",
+        element: "Writable",
+        parameter: nameEl?.text,
+      });
+      parsed = false;
+    }
 
-      if (parsed == null) {
-        warnings.push({
-          message: "Missing or invalid XML node",
-          element: "Writable",
-          parameter: param,
-        });
-        parsed = false;
-      }
-
-      try {
-        if (param && !param.endsWith("."))
-          return [Path.parse(param), false, parsed];
-        else return [Path.parse(param.slice(0, -1)), true, parsed];
-      } catch (err) {
-        warnings.push({
-          message: "Missing or invalid XML node",
-          element: "Name",
-          parameter: param,
-        });
-        return null;
-      }
-    })
-    .filter((e) => e != null);
+    try {
+      if (!nameEl) throw new Error("Missing Name element");
+      const param = nameEl.text;
+      if (!param.endsWith(".")) result.push([Path.parse(param), false, parsed]);
+      else result.push([Path.parse(param.slice(0, -1)), true, parsed]);
+    } catch {
+      warnings.push({
+        message: "Missing or invalid XML node",
+        element: "Name",
+        parameter: nameEl?.text,
+      });
+    }
+  }
+  return result;
 }
 
 const getValueType = memoize((str: string) => {
@@ -141,164 +163,168 @@ const getValueType = memoize((str: string) => {
 function parameterValueList(
   xml: Element,
 ): [Path, string | number | boolean, string][] {
-  return xml.children
-    .map<[Path, string | number | boolean, string]>((e) => {
-      if (e.localName !== "ParameterValueStruct") return null;
-      let valueElement: Element, param: string;
-      for (const c of e.children) {
-        switch (c.localName) {
-          case "Name":
-            param = c.text;
-            break;
-          case "Value":
-            valueElement = c;
-            break;
-        }
+  const result: [Path, string | number | boolean, string][] = [];
+  for (const e of xml.children) {
+    if (e.localName !== "ParameterValueStruct") continue;
+    let nameEl: Element | undefined;
+    let valueElement: Element | undefined;
+    for (const c of e.children) {
+      switch (c.localName) {
+        case "Name":
+          nameEl = c;
+          break;
+        case "Value":
+          valueElement = c;
+          break;
       }
+    }
 
-      let valueType = getValueType(valueElement.attrs);
-      if (!valueType) {
+    if (!valueElement) throw new Error("Missing Value element");
+
+    let valueType = getValueType(valueElement.attrs);
+    if (!valueType) {
+      warnings.push({
+        message: "Missing or invalid XML node",
+        attribute: "type",
+        parameter: nameEl?.text,
+      });
+      valueType = "xsd:string";
+    }
+
+    const value = decodeEntities(valueElement.text);
+    let parsed: string | number | boolean = value;
+    if (valueType === "xsd:boolean") {
+      const b = parseBool(value);
+      if (b == null) {
         warnings.push({
           message: "Missing or invalid XML node",
-          attribute: "type",
-          parameter: param,
+          element: "Value",
+          parameter: nameEl?.text,
         });
-        valueType = "xsd:string";
+      } else {
+        parsed = b;
       }
-
-      const value = decodeEntities(valueElement.text);
-      let parsed: string | number | boolean = value;
-      if (valueType === "xsd:boolean") {
-        parsed = parseBool(value);
-        if (parsed == null) {
-          warnings.push({
-            message: "Missing or invalid XML node",
-            element: "Value",
-            parameter: param,
-          });
-          parsed = value;
-        }
-      } else if (valueType === "xsd:int" || valueType === "xsd:unsignedInt") {
-        parsed = parseInt(value);
-        if (isNaN(parsed)) {
-          warnings.push({
-            message: "Missing or invalid XML node",
-            element: "Value",
-            parameter: param,
-          });
-          parsed = value;
-        }
-      } else if (valueType === "xsd:dateTime") {
-        parsed = Date.parse(value);
-        if (isNaN(parsed)) {
-          warnings.push({
-            message: "Missing or invalid XML node",
-            element: "Value",
-            parameter: param,
-          });
-          parsed = value;
-        }
-      }
-      try {
-        return [Path.parse(param), parsed, valueType];
-      } catch (err) {
+    } else if (valueType === "xsd:int" || valueType === "xsd:unsignedInt") {
+      parsed = parseInt(value);
+      if (isNaN(parsed)) {
         warnings.push({
           message: "Missing or invalid XML node",
-          element: "Name",
-          parameter: param,
+          element: "Value",
+          parameter: nameEl?.text,
         });
-        return null;
+        parsed = value;
       }
-    })
-    .filter((e) => e != null);
+    } else if (valueType === "xsd:dateTime") {
+      parsed = Date.parse(value);
+      if (isNaN(parsed)) {
+        warnings.push({
+          message: "Missing or invalid XML node",
+          element: "Value",
+          parameter: nameEl?.text,
+        });
+        parsed = value;
+      }
+    }
+
+    try {
+      if (!nameEl) throw new Error("Missing Name element");
+      result.push([Path.parse(nameEl.text), parsed, valueType]);
+    } catch {
+      warnings.push({
+        message: "Missing or invalid XML node",
+        element: "Name",
+        parameter: nameEl?.text,
+      });
+    }
+  }
+  return result;
 }
 
 function parameterAttributeList(xml: Element): [Path, number, string[]][] {
-  return xml.children
-    .map<[Path, number, string[]]>((e) => {
-      if (e.localName !== "ParameterAttributeStruct") return null;
-      let notificationElement: Element,
-        accessListElement: Element,
-        param: string;
-      for (const c of e.children) {
-        switch (c.localName) {
-          case "Name":
-            param = c.text;
-            break;
-          case "Notification":
-            notificationElement = c;
-            break;
-          case "AccessList":
-            accessListElement = c;
-            break;
-        }
+  const result: [Path, number, string[]][] = [];
+  for (const e of xml.children) {
+    if (e.localName !== "ParameterAttributeStruct") continue;
+    let nameEl: Element | undefined;
+    let notificationElement: Element | undefined;
+    let accessListElement: Element | undefined;
+    for (const c of e.children) {
+      switch (c.localName) {
+        case "Name":
+          nameEl = c;
+          break;
+        case "Notification":
+          notificationElement = c;
+          break;
+        case "AccessList":
+          accessListElement = c;
+          break;
       }
+    }
 
-      let notification = parseInt(notificationElement.text);
-      if (isNaN(notification)) {
-        warnings.push({
-          message: "Missing or invalid XML node",
-          element: "Notification",
-          parameter: param,
-        });
-        notification = 0;
-      }
+    if (!notificationElement) throw new Error("Missing Notification element");
+    if (!accessListElement) throw new Error("Missing AccessList element");
 
-      const accessList = accessListElement.children
-        .filter((c) => c.localName === "string")
-        .map((c) => decodeEntities(c.text));
+    let notification = parseInt(notificationElement.text);
+    if (isNaN(notification)) {
+      warnings.push({
+        message: "Missing or invalid XML node",
+        element: "Notification",
+        parameter: nameEl?.text,
+      });
+      notification = 0;
+    }
 
-      try {
-        return [Path.parse(param), notification, accessList];
-      } catch (err) {
-        warnings.push({
-          message: "Missing or invalid XML node",
-          element: "Name",
-          parameter: param,
-        });
-        return null;
-      }
-    })
-    .filter((e) => e != null);
+    const accessList = accessListElement.children
+      .filter((c) => c.localName === "string")
+      .map((c) => decodeEntities(c.text));
+
+    try {
+      if (!nameEl) throw new Error("Missing Name element");
+      result.push([Path.parse(nameEl.text), notification, accessList]);
+    } catch {
+      warnings.push({
+        message: "Missing or invalid XML node",
+        element: "Name",
+        parameter: nameEl?.text,
+      });
+    }
+  }
+  return result;
 }
 
-function GetParameterNames(methodRequest): string {
+function GetParameterNames(methodRequest: GetParameterNames): string {
   return `<cwmp:GetParameterNames><ParameterPath>${
     methodRequest.parameterPath
   }</ParameterPath><NextLevel>${+methodRequest.nextLevel}</NextLevel></cwmp:GetParameterNames>`;
 }
 
-function GetParameterNamesResponse(xml): GetParameterNamesResponse {
+function GetParameterNamesResponse(xml: Element): GetParameterNamesResponse {
   return {
     name: "GetParameterNamesResponse",
-    parameterList: parameterInfoList(
-      xml.children.find((n) => n.localName === "ParameterList"),
-    ),
+    parameterList: parameterInfoList(requireChild(xml, "ParameterList")),
   };
 }
 
-function GetParameterValues(methodRequest): string {
+function GetParameterValues(methodRequest: GetParameterValues): string {
   return `<cwmp:GetParameterValues><ParameterNames soap-enc:arrayType="xsd:string[${
     methodRequest.parameterNames.length
   }]">${methodRequest.parameterNames
-    .map((p) => `<string>${p}</string>`)
+    .map((p: string) => `<string>${p}</string>`)
     .join("")}</ParameterNames></cwmp:GetParameterValues>`;
 }
 
 function GetParameterValuesResponse(xml: Element): GetParameterValuesResponse {
   return {
     name: "GetParameterValuesResponse",
-    parameterList: parameterValueList(
-      xml.children.find((n) => n.localName === "ParameterList"),
-    ),
+    parameterList: parameterValueList(requireChild(xml, "ParameterList")),
   };
 }
 
-function GetParameterAttributes(methodRequest): string {
+function GetParameterAttributes(methodRequest: GetParameterAttributes): string {
   return `<cwmp:GetParameterAttributes><ParameterNames soap-enc:arrayType="xsd:string[${
     methodRequest.parameterNames.length
   }]">${methodRequest.parameterNames
-    .map((p) => `<string>${p}</string>`)
+    .map((p: string) => `<string>${p}</string>`)
     .join("")}</ParameterNames></cwmp:GetParameterAttributes>`;
 }
 
@@ -307,13 +333,11 @@ function GetParameterAttributesResponse(
 ): GetParameterAttributesResponse {
   return {
     name: "GetParameterAttributesResponse",
-    parameterList: parameterAttributeList(
-      xml.children.find((n) => n.localName === "ParameterList"),
-    ),
+    parameterList: parameterAttributeList(requireChild(xml, "ParameterList")),
   };
 }
 
-function SetParameterValues(methodRequest): string {
+function SetParameterValues(methodRequest: SetParameterValues): string {
   const params = methodRequest.parameterList.map((p) => {
     let val = p[1];
     if (p[2] === "xsd:dateTime" && typeof val === "number") {
@@ -336,15 +360,8 @@ function SetParameterValues(methodRequest): string {
 }
 
 function SetParameterValuesResponse(xml: Element): SetParameterValuesResponse {
-  let status: number;
-
-  for (const c of xml.children) {
-    switch (c.localName) {
-      case "Status":
-        status = parseInt(c.text);
-        break;
-    }
-  }
+  const statusEl = getChild(xml, "Status");
+  let status = statusEl ? parseInt(statusEl.text) : NaN;
 
   if (!(status >= 0)) {
     warnings.push({
@@ -360,7 +377,7 @@ function SetParameterValuesResponse(xml: Element): SetParameterValuesResponse {
   };
 }
 
-function SetParameterAttributes(methodRequest): string {
+function SetParameterAttributes(methodRequest: SetParameterAttributes): string {
   const params = methodRequest.parameterList.map((p) => {
     return `<SetParameterAttributesStruct><Name>${
       p[0]
@@ -375,7 +392,9 @@ function SetParameterAttributes(methodRequest): string {
     }]">${
       p[2] == null
         ? ""
-        : p[2].map((s) => `<string>${encodeEntities(s)}</string>`).join("")
+        : p[2]
+            .map((s: string) => `<string>${encodeEntities(s)}</string>`)
+            .join("")
     }</AccessList></SetParameterAttributesStruct>`;
   });
 
@@ -390,7 +409,7 @@ function SetParameterAttributesResponse(): SetParameterAttributesResponse {
   };
 }
 
-function AddObject(methodRequest): string {
+function AddObject(methodRequest: AddObject): string {
   return `<cwmp:AddObject><ObjectName>${
     methodRequest.objectName
   }</ObjectName><ParameterKey>${
@@ -399,17 +418,21 @@ function AddObject(methodRequest): string {
 }
 
 function AddObjectResponse(xml: Element): AddObjectResponse {
-  let instanceNumber: string, status: number;
+  let instanceNumberEl: Element | undefined;
+  let statusEl: Element | undefined;
   for (const c of xml.children) {
     switch (c.localName) {
       case "InstanceNumber":
-        instanceNumber = c.text;
+        instanceNumberEl = c;
         break;
       case "Status":
-        status = parseInt(c.text);
+        statusEl = c;
         break;
     }
   }
+
+  const instanceNumber = instanceNumberEl?.text ?? "";
+  let status = statusEl ? parseInt(statusEl.text) : NaN;
 
   if (!/^[0-9]+$/.test(instanceNumber))
     throw new Error("Missing or invalid instance number");
@@ -429,7 +452,7 @@ function AddObjectResponse(xml: Element): AddObjectResponse {
   };
 }
 
-function DeleteObject(methodRequest): string {
+function DeleteObject(methodRequest: DeleteObject): string {
   return `<cwmp:DeleteObject><ObjectName>${
     methodRequest.objectName
   }</ObjectName><ParameterKey>${
@@ -438,15 +461,8 @@ function DeleteObject(methodRequest): string {
 }
 
 function DeleteObjectResponse(xml: Element): DeleteObjectResponse {
-  let status: number;
-
-  for (const c of xml.children) {
-    switch (c.localName) {
-      case "Status":
-        status = parseInt(c.text);
-        break;
-    }
-  }
+  const statusEl = getChild(xml, "Status");
+  let status = statusEl ? parseInt(statusEl.text) : NaN;
 
   if (!(status >= 0)) {
     warnings.push({
@@ -462,7 +478,7 @@ function DeleteObjectResponse(xml: Element): DeleteObjectResponse {
   };
 }
 
-function Reboot(methodRequest): string {
+function Reboot(methodRequest: Reboot): string {
   return `<cwmp:Reboot><CommandKey>${
     methodRequest.commandKey || ""
   }</CommandKey></cwmp:Reboot>`;
@@ -484,12 +500,14 @@ function FactoryResetResponse(): FactoryResetResponse {
   };
 }
 
-function Download(methodRequest): string {
+function Download(methodRequest: Download): string {
   return `<cwmp:Download><CommandKey>${
     methodRequest.commandKey || ""
-  }</CommandKey><FileType>${methodRequest.fileType}</FileType><URL>${
-    methodRequest.url
-  }</URL><Username>${encodeEntities(
+  }</CommandKey><FileType>${encodeEntities(
+    methodRequest.fileType || "",
+  )}</FileType><URL>${encodeEntities(
+    methodRequest.url || "",
+  )}</URL><Username>${encodeEntities(
     methodRequest.username || "",
   )}</Username><Password>${encodeEntities(
     methodRequest.password || "",
@@ -506,21 +524,43 @@ function Download(methodRequest): string {
   )}</FailureURL></cwmp:Download>`;
 }
 
+function Upload(methodRequest: Upload): string {
+  return `<cwmp:Upload><CommandKey>${
+    methodRequest.commandKey || ""
+  }</CommandKey><FileType>${encodeEntities(
+    methodRequest.fileType || "",
+  )}</FileType><URL>${encodeEntities(
+    methodRequest.url || "",
+  )}</URL><Username>${encodeEntities(
+    methodRequest.username || "",
+  )}</Username><Password>${encodeEntities(
+    methodRequest.password || "",
+  )}</Password><DelaySeconds>${
+    methodRequest.delaySeconds || "0"
+  }</DelaySeconds></cwmp:Upload>`;
+}
+
 function DownloadResponse(xml: Element): DownloadResponse {
-  let status: number, startTime: number, completeTime: number;
+  let statusEl: Element | undefined;
+  let startTimeEl: Element | undefined;
+  let completeTimeEl: Element | undefined;
   for (const c of xml.children) {
     switch (c.localName) {
       case "Status":
-        status = parseInt(c.text);
+        statusEl = c;
         break;
       case "StartTime":
-        startTime = Date.parse(c.text);
+        startTimeEl = c;
         break;
       case "CompleteTime":
-        completeTime = Date.parse(c.text);
+        completeTimeEl = c;
         break;
     }
   }
+
+  let status = statusEl ? parseInt(statusEl.text) : NaN;
+  let startTime = startTimeEl ? Date.parse(startTimeEl.text) : NaN;
+  let completeTime = completeTimeEl ? Date.parse(completeTimeEl.text) : NaN;
 
   if (!(status >= 0)) {
     warnings.push({
@@ -530,7 +570,7 @@ function DownloadResponse(xml: Element): DownloadResponse {
     status = 0;
   }
 
-  if (startTime == null || isNaN(startTime)) {
+  if (isNaN(startTime)) {
     warnings.push({
       message: "Missing or invalid XML node",
       element: "StartTime",
@@ -538,7 +578,7 @@ function DownloadResponse(xml: Element): DownloadResponse {
     startTime = Date.parse("0001-01-01T00:00:00Z");
   }
 
-  if (completeTime == null || isNaN(completeTime)) {
+  if (isNaN(completeTime)) {
     warnings.push({
       message: "Missing or invalid XML node",
       element: "CompleteTime",
@@ -554,39 +594,99 @@ function DownloadResponse(xml: Element): DownloadResponse {
   };
 }
 
-function Inform(xml: Element): InformRequest {
-  let retryCount: number, evnt: string[];
-  let parameterList: [Path, string | number | boolean, string][];
-  const deviceId = {
-    Manufacturer: null,
-    OUI: null,
-    ProductClass: null,
-    SerialNumber: null,
-  };
-
+function UploadResponse(xml: Element): UploadResponse {
+  let statusEl: Element | undefined;
+  let startTimeEl: Element | undefined;
+  let completeTimeEl: Element | undefined;
   for (const c of xml.children) {
     switch (c.localName) {
-      case "ParameterList":
-        parameterList = parameterValueList(c);
+      case "Status":
+        statusEl = c;
         break;
-      case "DeviceId":
-        for (const cc of c.children) {
-          const n = cc.localName;
-          if (n in deviceId) deviceId[n] = decodeEntities(cc.text);
-        }
+      case "StartTime":
+        startTimeEl = c;
         break;
-      case "Event":
-        evnt = event(c);
-        break;
-      case "RetryCount":
-        retryCount = parseInt(c.text);
+      case "CompleteTime":
+        completeTimeEl = c;
         break;
     }
   }
 
-  if (!deviceId || !deviceId.SerialNumber || !deviceId.OUI)
+  let status = statusEl ? parseInt(statusEl.text) : NaN;
+  let startTime = startTimeEl ? Date.parse(startTimeEl.text) : NaN;
+  let completeTime = completeTimeEl ? Date.parse(completeTimeEl.text) : NaN;
+
+  if (!(status >= 0)) {
+    warnings.push({
+      message: "Missing or invalid XML node",
+      element: "Status",
+    });
+    status = 0;
+  }
+  if (isNaN(startTime)) {
+    warnings.push({
+      message: "Missing or invalid XML node",
+      element: "StartTime",
+    });
+    startTime = Date.parse("0001-01-01T00:00:00Z");
+  }
+
+  if (isNaN(completeTime)) {
+    warnings.push({
+      message: "Missing or invalid XML node",
+      element: "CompleteTime",
+    });
+    completeTime = Date.parse("0001-01-01T00:00:00Z");
+  }
+
+  return {
+    name: "UploadResponse",
+    status: status,
+    startTime: startTime,
+    completeTime: completeTime,
+  };
+}
+
+function Inform(xml: Element): InformRequest {
+  let paramListEl: Element | undefined;
+  let deviceIdEl: Element | undefined;
+  let eventEl: Element | undefined;
+  let retryCountEl: Element | undefined;
+  for (const c of xml.children) {
+    switch (c.localName) {
+      case "ParameterList":
+        paramListEl = c;
+        break;
+      case "DeviceId":
+        deviceIdEl = c;
+        break;
+      case "Event":
+        eventEl = c;
+        break;
+      case "RetryCount":
+        retryCountEl = c;
+        break;
+    }
+  }
+
+  const deviceId: InformRequest["deviceId"] = {
+    Manufacturer: "",
+    OUI: "",
+    ProductClass: "",
+    SerialNumber: "",
+  };
+  if (deviceIdEl) {
+    for (const cc of deviceIdEl.children) {
+      const n = cc.localName;
+      if (n in deviceId)
+        deviceId[n as keyof typeof deviceId] = decodeEntities(cc.text);
+    }
+  }
+
+  if (!deviceId.SerialNumber || !deviceId.OUI)
     throw new Error("Missing or invalid DeviceId element");
 
+  let parameterList = paramListEl ? parameterValueList(paramListEl) : undefined;
   if (!parameterList) {
     warnings.push({
       message: "Missing or invalid XML node",
@@ -595,12 +695,14 @@ function Inform(xml: Element): InformRequest {
     parameterList = [];
   }
 
+  let evnt = eventEl ? event(eventEl) : undefined;
   if (!evnt) {
     warnings.push({ message: "Missing or invalid XML node", element: "Event" });
     evnt = [];
   }
 
-  if (retryCount == null || isNaN(retryCount)) {
+  let retryCount = retryCountEl ? parseInt(retryCountEl.text) : NaN;
+  if (isNaN(retryCount)) {
     warnings.push({
       message: "Missing or invalid XML node",
       element: "RetryCount",
@@ -625,36 +727,39 @@ function GetRPCMethods(): GetRPCMethodsRequest {
   return { name: "GetRPCMethods" };
 }
 
-function GetRPCMethodsResponse(methodResponse): string {
+function GetRPCMethodsResponse(
+  methodResponse: GetRPCMethodsResponseType,
+): string {
   return `<cwmp:GetRPCMethodsResponse><MethodList soap-enc:arrayType="xsd:string[${
     methodResponse.methodList.length
   }]">${methodResponse.methodList
-    .map((m) => `<string>${m}</string>`)
+    .map((m: string) => `<string>${m}</string>`)
     .join("")}</MethodList></cwmp:GetRPCMethodsResponse>`;
 }
 
 function TransferComplete(xml: Element): TransferCompleteRequest {
-  let commandKey: string,
-    _faultStruct: FaultStruct,
-    startTime: number,
-    completeTime: number;
+  let commandKeyEl: Element | undefined;
+  let faultStructEl: Element | undefined;
+  let startTimeEl: Element | undefined;
+  let completeTimeEl: Element | undefined;
   for (const c of xml.children) {
     switch (c.localName) {
       case "CommandKey":
-        commandKey = c.text;
+        commandKeyEl = c;
         break;
       case "FaultStruct":
-        _faultStruct = faultStruct(c);
+        faultStructEl = c;
         break;
       case "StartTime":
-        startTime = Date.parse(c.text);
+        startTimeEl = c;
         break;
       case "CompleteTime":
-        completeTime = Date.parse(c.text);
+        completeTimeEl = c;
         break;
     }
   }
 
+  let commandKey = commandKeyEl?.text;
   if (commandKey == null) {
     warnings.push({
       message: "Missing or invalid XML node",
@@ -663,6 +768,7 @@ function TransferComplete(xml: Element): TransferCompleteRequest {
     commandKey = "";
   }
 
+  let _faultStruct = faultStructEl ? faultStruct(faultStructEl) : undefined;
   if (!_faultStruct) {
     warnings.push({
       message: "Missing or invalid XML node",
@@ -671,7 +777,8 @@ function TransferComplete(xml: Element): TransferCompleteRequest {
     _faultStruct = { faultCode: "0", faultString: "" };
   }
 
-  if (startTime == null || isNaN(startTime)) {
+  let startTime = startTimeEl ? Date.parse(startTimeEl.text) : NaN;
+  if (isNaN(startTime)) {
     warnings.push({
       message: "Missing or invalid XML node",
       element: "StartTime",
@@ -679,7 +786,8 @@ function TransferComplete(xml: Element): TransferCompleteRequest {
     startTime = Date.parse("0001-01-01T00:00:00Z");
   }
 
-  if (completeTime == null || isNaN(completeTime)) {
+  let completeTime = completeTimeEl ? Date.parse(completeTimeEl.text) : NaN;
+  if (isNaN(completeTime)) {
     warnings.push({
       message: "Missing or invalid XML node",
       element: "CompleteTime",
@@ -703,7 +811,7 @@ function TransferCompleteResponse(): string {
 function RequestDownload(xml: Element): RequestDownloadRequest {
   return {
     name: "RequestDownload",
-    fileType: xml.children.find((n) => n.localName === "FileType").text,
+    fileType: requireChild(xml, "FileType").text,
   };
 }
 
@@ -712,56 +820,61 @@ function RequestDownloadResponse(): string {
 }
 
 function AcsFault(f: CpeFault): string {
+  const detail = f.detail;
+  if (!detail) throw new Error("CpeFault.detail missing");
   return `<soap-env:Body:Fault><faultcode>${encodeEntities(
     f.faultCode,
   )}</faultcode><faultstring>${encodeEntities(
     f.faultString,
   )}</faultstring><detail><cwmp:Fault><FaultCode>${encodeEntities(
-    f.detail.faultCode,
+    detail.faultCode,
   )}</FaultCode><FaultString>${encodeEntities(
-    f.detail.faultString,
+    detail.faultString,
   )}</FaultString></cwmp:Fault></detail></soap-env:Body:Fault>`;
 }
 
 function faultStruct(xml: Element): FaultStruct {
-  let faultCode: string,
-    faultString: string,
-    setParameterValuesFault: SpvFault[],
-    pn: string,
-    fc: string,
-    fs: string;
+  let faultCodeEl: Element | undefined;
+  let faultStringEl: Element | undefined;
+  let setParameterValuesFault: SpvFault[] | undefined;
+
   for (const c of xml.children) {
     switch (c.localName) {
       case "FaultCode":
-        faultCode = c.text;
+        faultCodeEl = c;
         break;
       case "FaultString":
-        faultString = decodeEntities(c.text);
+        faultStringEl = c;
         break;
-      case "SetParameterValuesFault":
-        setParameterValuesFault = setParameterValuesFault || [];
-        pn = fc = fs = null;
+      case "SetParameterValuesFault": {
+        let pnEl: Element | undefined;
+        let fcEl: Element | undefined;
+        let fsEl: Element | undefined;
         for (const cc of c.children) {
           switch (cc.localName) {
             case "ParameterName":
-              pn = cc.text;
+              pnEl = cc;
               break;
             case "FaultCode":
-              fc = cc.text;
+              fcEl = cc;
               break;
             case "FaultString":
-              fs = decodeEntities(cc.text);
+              fsEl = cc;
               break;
           }
         }
+        setParameterValuesFault = setParameterValuesFault ?? [];
         setParameterValuesFault.push({
-          parameterName: pn,
-          faultCode: fc,
-          faultString: fs,
+          parameterName: pnEl?.text ?? "",
+          faultCode: fcEl?.text ?? "",
+          faultString: fsEl ? decodeEntities(fsEl.text) : "",
         });
+        break;
+      }
     }
   }
 
+  let faultCode = faultCodeEl?.text;
   if (faultCode == null) {
     warnings.push({
       message: "Missing or invalid XML node",
@@ -770,6 +883,9 @@ function faultStruct(xml: Element): FaultStruct {
     faultCode = "";
   }
 
+  let faultString = faultStringEl
+    ? decodeEntities(faultStringEl.text)
+    : undefined;
   if (faultString == null) {
     warnings.push({
       message: "Missing or invalid XML node",
@@ -782,23 +898,27 @@ function faultStruct(xml: Element): FaultStruct {
 }
 
 function fault(xml: Element): CpeFault {
-  let faultCode: string, faultString: string, detail: FaultStruct;
+  let faultCodeEl: Element | undefined;
+  let faultStringEl: Element | undefined;
+  let detailEl: Element | undefined;
   for (const c of xml.children) {
     switch (c.localName) {
       case "faultcode":
-        faultCode = c.text;
+        faultCodeEl = c;
         break;
       case "faultstring":
-        faultString = decodeEntities(c.text);
+        faultStringEl = c;
         break;
       case "detail":
-        detail = faultStruct(c.children.find((n) => n.localName === "Fault"));
+        detailEl = c;
         break;
     }
   }
 
-  if (!detail) throw new Error("Missing detail element");
+  if (!detailEl) throw new Error("Missing detail element");
+  const detail = faultStruct(requireChild(detailEl, "Fault"));
 
+  let faultCode = faultCodeEl?.text;
   if (faultCode == null) {
     warnings.push({
       message: "Missing or invalid XML node",
@@ -807,6 +927,9 @@ function fault(xml: Element): CpeFault {
     faultCode = "Client";
   }
 
+  let faultString = faultStringEl
+    ? decodeEntities(faultStringEl.text)
+    : undefined;
   if (faultString == null) {
     warnings.push({
       message: "Missing or invalid XML node",
@@ -824,14 +947,14 @@ export function request(
 ): SoapMessage {
   warnings = warn;
 
-  const rpc = {
-    id: null,
-    cwmpVersion: null,
-    sessionTimeout: null,
-    cpeRequest: null,
-    cpeFault: null,
-    cpeResponse: null,
-    unknownMethod: null,
+  const rpc: SoapMessage = {
+    id: "",
+    cwmpVersion: "",
+    sessionTimeout: 0,
+    cpeRequest: undefined,
+    cpeFault: undefined,
+    cpeResponse: undefined,
+    unknownMethod: undefined,
   };
 
   if (!body.length) return rpc;
@@ -842,8 +965,8 @@ export function request(
 
   const envelope = xml.children[0];
 
-  let headerElement: Element, bodyElement: Element;
-
+  let headerElement: Element | undefined;
+  let bodyElement: Element | undefined;
   for (const c of envelope.children) {
     switch (c.localName) {
       case "Header":
@@ -854,24 +977,29 @@ export function request(
         break;
     }
   }
+  if (!bodyElement) throw new Error("Missing SOAP Body element");
 
   if (headerElement) {
+    let idEl: Element | undefined;
+    let sessionTimeoutEl: Element | undefined;
     for (const c of headerElement.children) {
       switch (c.localName) {
         case "ID":
-          rpc.id = decodeEntities(c.text);
+          idEl = c;
           break;
         case "sessionTimeout":
-          rpc.sessionTimeout = parseInt(c.text);
+          sessionTimeoutEl = c;
           break;
       }
     }
+    if (idEl) rpc.id = decodeEntities(idEl.text);
+    if (sessionTimeoutEl) rpc.sessionTimeout = parseInt(sessionTimeoutEl.text);
   }
 
   const methodElement = bodyElement.children[0];
 
   if (methodElement.localName === "Inform") {
-    let namespace, namespaceHref;
+    let namespace: string | undefined, namespaceHref: string | undefined;
     for (const e of [methodElement, bodyElement, envelope]) {
       namespace = namespace || e.namespace;
       if (e.attrs) {
@@ -949,6 +1077,9 @@ export function request(
     case "DownloadResponse":
       rpc.cpeResponse = DownloadResponse(methodElement);
       break;
+    case "UploadResponse":
+      rpc.cpeResponse = UploadResponse(methodElement);
+      break;
     case "Fault":
       rpc.cpeFault = fault(methodElement);
       break;
@@ -960,7 +1091,7 @@ export function request(
   return rpc;
 }
 
-const namespacesAttrs = {
+const namespacesAttrs: Record<string, string> = {
   "1.0": Object.entries(NAMESPACES["1.0"])
     .map(([k, v]) => `xmlns:${k}="${v}"`)
     .join(" "),
@@ -978,14 +1109,16 @@ const namespacesAttrs = {
     .join(" "),
 };
 
-export function response(rpc: {
-  id: string;
-  acsRequest?: AcsRequest;
-  acsResponse?: AcsResponse;
-  acsFault?: CpeFault;
-  cwmpVersion?: string;
-}): { code: number; headers: Record<string, string>; data: string } {
-  const headers = {
+export function response(
+  rpc: {
+    id: string;
+    cwmpVersion: string;
+    acsRequest?: AcsRequest;
+    acsResponse?: AcsResponse;
+    acsFault?: CpeFault;
+  } | null,
+): { code: number; headers: Record<string, string>; data: string } {
+  const headers: Record<string, string> = {
     Server: SERVER_NAME,
     SOAPServer: SERVER_NAME,
   };
@@ -1045,6 +1178,9 @@ export function response(rpc: {
         break;
       case "Download":
         body = Download(rpc.acsRequest);
+        break;
+      case "Upload":
+        body = Upload(rpc.acsRequest);
         break;
       default:
         throw new Error(

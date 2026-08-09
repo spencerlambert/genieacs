@@ -1,10 +1,12 @@
-import { ClosureComponent } from "mithril";
+import { ClosureComponent } from "../mithril-compat.ts";
 import { m } from "../components.ts";
 import * as notifications from "../notifications.ts";
-import * as store from "../store.ts";
-import { getIcon } from "../icons.ts";
+import * as store from "../legacy-store.ts";
+import { updateTags } from "../api-client.ts";
+import { evaluateExpression, invalidate } from "../reactive-store.ts";
+import { icon } from "../icons.ts";
 import { decodeTag } from "../../lib/util.ts";
-import { Expression } from "../../lib/types.ts";
+import Expression from "../../lib/common/expression.ts";
 import { FlatDevice } from "../../lib/ui/db.ts";
 
 interface Attrs {
@@ -17,46 +19,64 @@ const component: ClosureComponent<Attrs> = () => {
     view: (vnode) => {
       const device = vnode.attrs.device;
       let writable = true;
-      if ("writable" in vnode.attrs)
-        writable = !!store.evaluateExpression(vnode.attrs.writable, device);
+      if (vnode.attrs.writable)
+        writable = !!evaluateExpression(vnode.attrs.writable, device).value;
 
       const tags = [];
       for (const p of Object.keys(device))
-        if (p.startsWith("Tags.")) tags.push(decodeTag(p.slice(5)));
+        if (p.startsWith("Tags.") && p.lastIndexOf(":") === -1)
+          tags.push(decodeTag(p.slice(5)));
 
       tags.sort();
 
       if (!writable) {
         return m(
-          ".tags",
-          tags.map((t) => m("span.tag", t)),
+          "div",
+          tags.map((t) =>
+            m(
+              "span",
+              {
+                class:
+                  "inline-flex items-center px-3 py-0.5 rounded-full text-sm font-medium bg-yellow-100 text-yellow-800 mr-2 -my-0.5 ring-1 ring-yellow-200",
+              },
+              t,
+            ),
+          ),
         );
       }
 
       return m(
-        ".tags",
+        "div",
         tags.map((tag) =>
           m(
-            "span.tag",
+            "span",
+            {
+              class:
+                "inline-flex items-center pl-3 pr-1 py-0.5 rounded-full text-sm font-medium bg-yellow-100 text-yellow-800 mr-2 ring-1 ring-yellow-200",
+            },
             tag,
             m(
               "button",
               {
-                onclick: (e) => {
-                  e.target.disabled = true;
-                  const deviceId = device["DeviceID.ID"].value[0] as string;
-                  store
-                    .updateTags(deviceId, { [tag]: false })
+                title: "Remove tag",
+                class:
+                  "flex-shrink-0 ml-0.5 h-4 w-4 rounded-full inline-flex items-center justify-center text-yellow-400 hover:bg-yellow-200 hover:text-yellow-500 focus:outline-hidden focus:bg-yellow-500 focus:text-white",
+                onclick: (e: MouseEvent) => {
+                  const btn = e.currentTarget as HTMLButtonElement;
+                  btn.disabled = true;
+                  const deviceId = device["DeviceID.ID"] as string;
+                  updateTags(deviceId, { [tag]: false })
                     .then(() => {
-                      e.target.disabled = false;
+                      btn.disabled = false;
                       notifications.push(
                         "success",
                         `${deviceId}: Tags updated`,
                       );
                       store.setTimestamp(Date.now());
+                      invalidate(Date.now());
                     })
                     .catch((err) => {
-                      e.target.disabled = false;
+                      btn.disabled = false;
                       notifications.push(
                         "error",
                         `${deviceId}: ${err.message}`,
@@ -64,39 +84,55 @@ const component: ClosureComponent<Attrs> = () => {
                     });
                 },
               },
-              getIcon("remove"),
+              m("span.sr-only", "Remove tag"),
+              m(icon, {
+                name: "remove",
+                class: "h-4 w-4",
+              }),
             ),
           ),
         ),
         m(
-          "span.tag.writable",
-          m.trust("&nbsp;"),
+          "span",
+          {
+            class:
+              "inline-flex items-center pl-1 pr-1 py-0.5 rounded-full text-sm font-medium bg-yellow-50 ring-1 ring-yellow-200",
+          },
+          "\u200B",
           m(
             "button",
             {
-              onclick: (e) => {
-                e.target.disabled = true;
-                const deviceId = device["DeviceID.ID"].value[0] as string;
+              title: "Add tag",
+              class:
+                "flex-shrink-0 h-4 w-4 rounded-full inline-flex items-center justify-center text-yellow-400 hover:bg-yellow-200 hover:text-yellow-500 focus:outline-hidden focus:bg-yellow-500 focus:text-white",
+              onclick: (e: MouseEvent) => {
+                const btn = e.currentTarget as HTMLButtonElement;
+                btn.disabled = true;
+                const deviceId = device["DeviceID.ID"] as string;
                 const tag = prompt(`Enter tag to assign to device:`);
                 if (!tag) {
-                  e.target.disabled = false;
+                  btn.disabled = false;
                   return;
                 }
 
-                store
-                  .updateTags(deviceId, { [tag]: true })
+                updateTags(deviceId, { [tag]: true })
                   .then(() => {
-                    e.target.disabled = false;
+                    btn.disabled = false;
                     notifications.push("success", `${deviceId}: Tags updated`);
                     store.setTimestamp(Date.now());
+                    invalidate(Date.now());
                   })
                   .catch((err) => {
-                    e.target.disabled = false;
+                    btn.disabled = false;
                     notifications.push("error", `${deviceId}: ${err.message}`);
                   });
               },
             },
-            getIcon("add"),
+            m("span.sr-only", "Add tag"),
+            m(icon, {
+              name: "add",
+              class: "h-4 w-4",
+            }),
           ),
         ),
       );

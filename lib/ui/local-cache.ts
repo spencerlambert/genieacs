@@ -1,16 +1,16 @@
 import * as crypto from "node:crypto";
-import * as config from "../config.ts";
 import { collections } from "../db/db.ts";
-import * as expression from "../common/expression/util.ts";
-import { parse } from "../common/expression/parser.ts";
-import { Expression, Users, Permissions, Config, UiConfig } from "../types.ts";
+import Expression, { Value } from "../common/expression.ts";
+import { Users, Permissions, Config, UiConfig, Views } from "../types.ts";
 import { LocalCache } from "../local-cache.ts";
+import { bundleViews } from "../bundle-views.ts";
 
 interface Snapshot {
   permissions: Permissions;
   users: Users;
   config: Config;
   ui: UiConfig;
+  viewsBundle: string;
 }
 
 async function fetchPermissions(): Promise<[string, Permissions]> {
@@ -26,12 +26,14 @@ async function fetchPermissions(): Promise<[string, Permissions]> {
     if (!permissions[p.role]) permissions[p.role] = {};
     if (!permissions[p.role][p.access]) permissions[p.role][p.access] = {};
 
+    let validate: Expression;
+    if (p.validate) validate = Expression.parse(p.validate);
+    else validate = new Expression.Literal(true);
     permissions[p.role][p.access][p.resource] = {
       access: p.access,
-      filter: parse(p.filter || "true"),
+      filter: Expression.parse(p.filter || "true"),
+      validate,
     };
-    if (p.validate)
-      permissions[p.role][p.access][p.resource].validate = parse(p.validate);
   }
 
   return [h, permissions];
@@ -44,7 +46,7 @@ async function fetchUsers(): Promise<[string, Users]> {
     .createHash("md5")
     .update(JSON.stringify(_users))
     .digest("hex");
-  const users = {};
+  const users: Users = {};
 
   for (const user of _users) {
     users[user._id] = {
@@ -62,36 +64,34 @@ async function fetchConfig(): Promise<[string, Config, UiConfig]> {
   conf.sort((a, b) => (a._id > b._id ? 1 : -1));
   const h = crypto.createHash("md5").update(JSON.stringify(conf)).digest("hex");
 
-  const ui = {
-    filters: {},
-    device: {},
-    index: {},
-    overview: {},
-    pageSize: null,
-  };
+  const ui: UiConfig = {};
 
-  const _config = {};
+  const _config: Config = {};
 
   for (const c of conf) {
-    // Evaluate expressions to simplify them
-    const val = expression.evaluate(parse(c.value));
-    _config[c._id] = val;
     if (c._id.startsWith("ui.")) {
-      const keys = c._id.split(".");
-      if (!(keys[1] in ui)) continue;
-      // remove the first key(ui)
-      keys.shift();
-      let ref = ui;
-      while (keys.length > 1) {
-        const k = keys.shift();
-        if (ref[k] == null || typeof ref[k] !== "object") ref[k] = {};
-        ref = ref[k];
-      }
-      ref[keys[0]] = val;
+      ui[c._id.slice(3)] = c.value;
+      continue;
     }
+    // Evaluate expressions to simplify them
+    const val = Expression.parse(c.value).evaluate((e) => e);
+    _config[c._id] = val;
   }
 
   return [h, _config, ui];
+}
+
+async function fetchViews(): Promise<[string, Views]> {
+  const res = await collections.views.find().toArray();
+  const h = crypto.createHash("md5").update(JSON.stringify(res)).digest("hex");
+  const views: Views = {};
+  for (const r of res) {
+    views[r["_id"]] = {
+      md5: crypto.createHash("md5").update(r["script"]).digest("hex"),
+      script: r.script,
+    };
+  }
+  return [h, views];
 }
 
 const localCache = new LocalCache<Snapshot>("ui-local-cache-hash", refresh);
@@ -101,6 +101,7 @@ async function refresh(): Promise<[string, Snapshot]> {
     fetchPermissions(),
     fetchUsers(),
     fetchConfig(),
+    fetchViews(),
   ]);
 
   const h = crypto.createHash("md5");
@@ -111,6 +112,7 @@ async function refresh(): Promise<[string, Snapshot]> {
     users: res[1][1],
     config: res[2][1],
     ui: res[2][2],
+    viewsBundle: await bundleViews(res[3][1]),
   };
 
   return [h.digest("hex"), snapshot];
@@ -123,47 +125,35 @@ export async function getRevision(): Promise<string> {
 export function getConfig(
   revision: string,
   key: string,
-  context: Record<string, unknown>,
-  now: number,
-  cb?: (e: Expression) => Expression,
-): string | number | boolean | null {
+  dflt: string,
+  fn: (e: Expression) => Expression.Literal,
+): string;
+export function getConfig(
+  revision: string,
+  key: string,
+  dflt: number,
+  fn: (e: Expression) => Expression.Literal,
+): number;
+export function getConfig(
+  revision: string,
+  key: string,
+  dflt: boolean,
+  fn: (e: Expression) => Expression.Literal,
+): boolean;
+export function getConfig(
+  revision: string,
+  key: string,
+  dflt: Value,
+  fn: (e: Expression) => Expression.Literal,
+): Value {
   const snapshot = localCache.get(revision);
   if (!snapshot) throw new Error("Cache snapshot does not exist");
 
-  const oldOpts = {
-    "cwmp.downloadTimeout": "DOWNLOAD_TIMEOUT",
-    "cwmp.debug": "DEBUG",
-    "cwmp.retryDelay": "RETRY_DELAY",
-    "cwmp.sessionTimeout": "SESSION_TIMEOUT",
-    "cwmp.connectionRequestTimeout": "CONNECTION_REQUEST_TIMEOUT",
-    "cwmp.gpnNextLevel": "GPN_NEXT_LEVEL",
-    "cwmp.gpvBatchSize": "GPV_BATCH_SIZE",
-    "cwmp.cookiesPath": "COOKIES_PATH",
-    "cwmp.datetimeMilliseconds": "DATETIME_MILLISECONDS",
-    "cwmp.booleanLiteral": "BOOLEAN_LITERAL",
-    "cwmp.connectionRequestAllowBasicAuth":
-      "CONNECTION_REQUEST_ALLOW_BASIC_AUTH",
-    "cwmp.maxCommitIterations": "MAX_COMMIT_ITERATIONS",
-    "cwmp.deviceOnlineThreshold": "DEVICE_ONLINE_THRESHOLD",
-    "cwmp.udpConnectionRequestPort": "UDP_CONNECTION_REQUEST_PORT",
-  };
-
-  if (!(key in snapshot.config)) {
-    if (key in oldOpts) {
-      let id;
-      if (context?.["id"]) {
-        id = context["id"];
-      } else if (cb) {
-        id = cb(["PARAM", "DeviceID.ID"]);
-        if (Array.isArray(id)) id = null;
-      }
-      return config.get(oldOpts[key], id);
-    }
-    return null;
-  }
-
-  const v = expression.evaluate(snapshot.config[key], context, now, cb);
-  return Array.isArray(v) ? null : v;
+  const e = snapshot.config[key];
+  if (!e) return dflt;
+  const v = e.evaluate(fn).value;
+  if (typeof v !== typeof dflt) return dflt;
+  return v;
 }
 
 export function getConfigExpression(revision: string, key: string): Expression {
@@ -184,4 +174,9 @@ export function getPermissions(revision: string): Permissions {
 export function getUiConfig(revision: string): UiConfig {
   const snapshot = localCache.get(revision);
   return snapshot.ui;
+}
+
+export function getViewsBundle(revision: string): string {
+  const snapshot = localCache.get(revision);
+  return snapshot.viewsBundle;
 }

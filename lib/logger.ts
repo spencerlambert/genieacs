@@ -21,7 +21,7 @@ const defaultMeta: { [name: string]: any } = {};
 let LOG_SYSTEMD = false;
 let ACCESS_LOG_SYSTEMD = false;
 
-let LOG_FILE, ACCESS_LOG_FILE;
+let LOG_FILE: string, ACCESS_LOG_FILE: string;
 
 declare global {
   /* eslint-disable-next-line @typescript-eslint/no-namespace */
@@ -38,10 +38,10 @@ declare module "fs" {
   }
 }
 
-let logStream = fs.createWriteStream(null, { fd: process.stderr.fd });
-let logStat = fs.fstatSync(logStream.fd);
-let accessLogStream = fs.createWriteStream(null, { fd: process.stdout.fd });
-let accessLogStat = fs.fstatSync(accessLogStream.fd);
+let logStream = fs.createWriteStream("", { fd: process.stderr.fd });
+let logStat = fs.fstatSync(logStream.fd!);
+let accessLogStream = fs.createWriteStream("", { fd: process.stdout.fd });
+let accessLogStat = fs.fstatSync(accessLogStream.fd!);
 
 // Reopen if original files have been moved (e.g. logrotate)
 function reopen(): void {
@@ -54,10 +54,10 @@ function reopen(): void {
 
       if (!(stat && stat.dev === logStat.dev && stat.ino === logStat.ino)) {
         logStream.end();
-        logStream = fs.createWriteStream(null, {
+        logStream = fs.createWriteStream("", {
           fd: fs.openSync(LOG_FILE, "a"),
         });
-        logStat = fs.fstatSync(logStream.fd);
+        logStat = fs.fstatSync(logStream.fd!);
       }
 
       if (--counter === 0)
@@ -78,10 +78,10 @@ function reopen(): void {
         )
       ) {
         accessLogStream.end();
-        accessLogStream = fs.createWriteStream(null, {
+        accessLogStream = fs.createWriteStream("", {
           fd: fs.openSync(ACCESS_LOG_FILE, "a"),
         });
-        accessLogStat = fs.fstatSync(accessLogStream.fd);
+        accessLogStat = fs.fstatSync(accessLogStream.fd!);
       }
 
       if (--counter === 0)
@@ -99,19 +99,21 @@ export function init(service: string, version: string): void {
   defaultMeta.name = `genieacs-${service}`;
   defaultMeta.version = version;
 
-  LOG_FILE = config.get(`${service.toUpperCase()}_LOG_FILE`);
-  ACCESS_LOG_FILE = config.get(`${service.toUpperCase()}_ACCESS_LOG_FILE`);
+  LOG_FILE = config.get(`${service.toUpperCase()}_LOG_FILE`) as string;
+  ACCESS_LOG_FILE = config.get(
+    `${service.toUpperCase()}_ACCESS_LOG_FILE`,
+  ) as string;
 
   if (LOG_FILE) {
-    logStream = fs.createWriteStream(null, { fd: fs.openSync(LOG_FILE, "a") });
-    logStat = fs.fstatSync(logStream.fd);
+    logStream = fs.createWriteStream("", { fd: fs.openSync(LOG_FILE, "a") });
+    logStat = fs.fstatSync(logStream.fd!);
   }
 
   if (ACCESS_LOG_FILE) {
-    accessLogStream = fs.createWriteStream(null, {
+    accessLogStream = fs.createWriteStream("", {
       fd: fs.openSync(ACCESS_LOG_FILE, "a"),
     });
-    accessLogStat = fs.fstatSync(accessLogStream.fd);
+    accessLogStat = fs.fstatSync(accessLogStream.fd!);
   }
 
   // Determine if logs are going to journald
@@ -141,9 +143,11 @@ export function flatten(
   if (details.sessionContext) {
     const sessionContext = details.sessionContext as SessionContext;
     details.deviceId = sessionContext.deviceId;
-    details.remoteAddress = getRequestOrigin(
-      sessionContext.httpRequest,
-    ).remoteAddress;
+    if (sessionContext.httpRequest) {
+      details.remoteAddress = getRequestOrigin(
+        sessionContext.httpRequest,
+      ).remoteAddress;
+    }
     delete details.sessionContext;
   }
 
@@ -156,7 +160,7 @@ export function flatten(
   }
 
   if (details.task) {
-    details.taskId = details.task["_id"];
+    details.taskId = (details.task as { _id: string })["_id"];
     delete details.task;
   }
 
@@ -170,8 +174,8 @@ export function flatten(
     if (rpc.acsRequest) {
       details.acsRequestId = rpc.id;
       details.acsRequestName = rpc.acsRequest.name;
-      if (rpc.acsRequest["commandKey"])
-        details.acsRequestCommandKey = rpc.acsRequest["commandKey"];
+      const commandKey = (rpc.acsRequest as { commandKey?: string }).commandKey;
+      if (commandKey) details.acsRequestCommandKey = commandKey;
     } else if (rpc.cpeRequest) {
       details.cpeRequestId = rpc.id;
       if (rpc.cpeRequest.name === "Inform") {
@@ -179,13 +183,16 @@ export function flatten(
         details.informRetryCount = (rpc.cpeRequest as InformRequest).retryCount;
       } else {
         details.cpeRequestName = rpc.cpeRequest.name;
-        if (rpc.cpeRequest["commandKey"])
-          details.cpeRequestCommandKey = rpc.cpeRequest["commandKey"];
+        const commandKey = (rpc.cpeRequest as { commandKey?: string })
+          .commandKey;
+        if (commandKey) details.cpeRequestCommandKey = commandKey;
       }
     } else if (rpc.cpeFault) {
       details.acsRequestId = rpc.id;
-      details.cpeFaultCode = rpc.cpeFault.detail.faultCode;
-      details.cpeFaultString = rpc.cpeFault.detail.faultString;
+      if (rpc.cpeFault.detail) {
+        details.cpeFaultCode = rpc.cpeFault.detail.faultCode;
+        details.cpeFaultString = rpc.cpeFault.detail.faultString;
+      }
     }
     delete details.rpc;
   }
@@ -199,11 +206,12 @@ export function flatten(
 
   // For genieacs-ui
   if (details.context) {
-    details.remoteAddress = getRequestOrigin(
-      details.context["req"],
-    ).remoteAddress;
-    if (details.context["state"].user)
-      details.user = details.context["state"].user.username;
+    const ctx = details.context as {
+      req: Parameters<typeof getRequestOrigin>[0];
+      state: { user?: { username: string } };
+    };
+    details.remoteAddress = getRequestOrigin(ctx.req).remoteAddress;
+    if (ctx.state.user) details.user = ctx.state.user.username;
     delete details.context;
   }
 
@@ -233,7 +241,7 @@ function formatSimple(
   details: Record<string, unknown>,
   systemd: boolean,
 ): string {
-  const skip = {
+  const skip: Record<string, boolean> = {
     user: true,
     remoteAddress: true,
     severity: true,

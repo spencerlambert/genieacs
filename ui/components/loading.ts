@@ -1,13 +1,18 @@
-import { VnodeDOM, ClosureComponent, Component } from "mithril";
+import { VnodeDOM, ClosureComponent, Component } from "../mithril-compat.ts";
+import { QueryResponse } from "../legacy-store.ts";
 
-const component: ClosureComponent = (): Component => {
-  let overlay: HTMLElement;
-  let dom: Element;
+interface Attrs {
+  queries: QueryResponse[];
+}
+
+const component: ClosureComponent<Attrs> = (): Component<Attrs> => {
+  let overlay: HTMLElement | null = null;
+  let dom: Element | null = null;
   let loading = false;
 
-  function apply(vnode: VnodeDOM): void {
+  function apply(vnode: VnodeDOM<Attrs>): void {
     if (!loading) {
-      if (overlay) overlay.parentElement.remove();
+      if (overlay) overlay.parentElement?.remove();
       if (dom) dom.classList.remove("loading");
       overlay = null;
       dom = null;
@@ -16,7 +21,7 @@ const component: ClosureComponent = (): Component => {
 
     if (dom && dom !== vnode.dom) dom.classList.remove("loading");
 
-    dom = vnode.dom;
+    dom = vnode.dom!;
     dom.classList.add("loading");
 
     if (!overlay) {
@@ -29,9 +34,9 @@ const component: ClosureComponent = (): Component => {
       wrapper.appendChild(overlay);
     }
 
-    const wrapper = overlay.parentElement;
+    const wrapper = overlay.parentElement!;
     if (wrapper.parentElement !== dom.parentElement)
-      dom.parentNode.appendChild(wrapper);
+      dom.parentNode!.appendChild(wrapper);
 
     const wrapperRect = wrapper.getBoundingClientRect();
     const domRect = dom.getBoundingClientRect();
@@ -43,14 +48,13 @@ const component: ClosureComponent = (): Component => {
 
   return {
     view: (vnode) => {
-      const queries = vnode.attrs["queries"];
-      loading = queries.some((q) => q.fulfilling);
+      loading = vnode.attrs.queries.some((q) => q.fulfilling);
       return vnode.children;
     },
     oncreate: apply,
     onupdate: apply,
     onremove: () => {
-      if (overlay) overlay.parentElement.remove();
+      if (overlay) overlay.parentElement!.remove();
       if (dom) dom.classList.remove("loading");
       overlay = null;
       dom = null;

@@ -1,0 +1,1196 @@
+import test from "node:test";
+import assert from "node:assert";
+import {
+  ConstSignal,
+  SignalBase,
+  StateSignal,
+  ComputedSignal,
+  Watcher,
+  setTimeout,
+  setInterval,
+  registerCleanup,
+  runWithCleanupOwner,
+  currentCleanupOwner,
+  abortSignal,
+} from "../ui/signals.ts";
+
+// =============================================================================
+// ConstSignal Tests
+// =============================================================================
+
+void test("ConstSignal returns constant value", () => {
+  const signal = new ConstSignal(42);
+  assert.strictEqual(signal.get(), 42);
+  assert.strictEqual(signal.get(), 42);
+
+  // Works with different types
+  const strSignal = new ConstSignal("hello");
+  assert.strictEqual(strSignal.get(), "hello");
+
+  const objSignal = new ConstSignal({ a: 1 });
+  assert.strictEqual(objSignal.get().a, 1);
+  assert.strictEqual(objSignal.get(), objSignal.get()); // Same reference
+});
+
+void test("ConstSignal extends SignalBase but doesn't allocate _sinks", () => {
+  const constant = new ConstSignal(42);
+
+  // ConstSignal extends SignalBase for proper type hierarchy
+  assert.strictEqual(constant instanceof SignalBase, true);
+
+  // But doesn't allocate _sinks (optimization)
+  assert.strictEqual((constant as any)._sinks, undefined);
+});
+
+// =============================================================================
+// StateSignal Tests
+// =============================================================================
+
+void test("StateSignal get and set", () => {
+  const signal = new StateSignal(42);
+  assert.strictEqual(signal.get(), 42);
+
+  signal.set(100);
+  assert.strictEqual(signal.get(), 100);
+});
+
+void test("StateSignal.set() with same value (Object.is) doesn't trigger updates", () => {
+  const signal = new StateSignal(1);
+  let computeCount = 0;
+
+  const computed = new ComputedSignal(() => {
+    computeCount++;
+    return signal.get() * 2;
+  });
+
+  assert.strictEqual(computed.get(), 2);
+  assert.strictEqual(computeCount, 1);
+
+  // Set to same value
+  signal.set(1);
+  assert.strictEqual(computed.get(), 2);
+  assert.strictEqual(computeCount, 1);
+
+  // Object.is(NaN, NaN) is true
+  const nanSignal = new StateSignal(NaN);
+  let nanComputeCount = 0;
+  const nanComputed = new ComputedSignal(() => {
+    nanComputeCount++;
+    return nanSignal.get();
+  });
+  nanComputed.get();
+  nanSignal.set(NaN);
+  nanComputed.get();
+  assert.strictEqual(nanComputeCount, 1);
+});
+
+void test("StateSignal.update applies fn to current value and notifies", () => {
+  const signal = new StateSignal(1);
+  let computeCount = 0;
+  const computed = new ComputedSignal(() => {
+    computeCount++;
+    return signal.get() * 2;
+  });
+  assert.strictEqual(computed.get(), 2);
+
+  signal.update((v) => v + 1);
+  assert.strictEqual(signal.get(), 2);
+  assert.strictEqual(computed.get(), 4);
+  assert.strictEqual(computeCount, 2);
+
+  // Goes through set(): an equal result is a no-op for dependents
+  signal.update((v) => v);
+  assert.strictEqual(computed.get(), 4);
+  assert.strictEqual(computeCount, 2);
+});
+
+void test("StateSignal.update inside a computed registers no dependency", () => {
+  // update() is a command, not a subscription: an effect that appends to a
+  // list must not re-run (and re-append) when the list later changes.
+  const list = new StateSignal<number[]>([]);
+  let runs = 0;
+  const effect = new ComputedSignal(() => {
+    runs++;
+    list.update((prev) => [...prev, runs]);
+    return null;
+  });
+
+  effect.get();
+  assert.strictEqual(runs, 1);
+  assert.deepStrictEqual(list.get(), [1]);
+
+  // An external write to the list must not dirty the effect computed
+  list.set([]);
+  effect.get();
+  assert.strictEqual(runs, 1);
+});
+
+void test("StateSignal.update throws on disposed signal", () => {
+  const signal = new StateSignal(1);
+  signal[Symbol.dispose]();
+  assert.throws(
+    () => {
+      signal.update((v) => v + 1);
+    },
+    { message: "Cannot write to disposed signal" },
+  );
+});
+
+void test("Can subclass StateSignal", () => {
+  class Counter extends StateSignal<number> {
+    increment(): void {
+      this.set(this.get() + 1);
+    }
+  }
+
+  const counter = new Counter(0);
+  counter.increment();
+  counter.increment();
+
+  assert.strictEqual(counter.get(), 2);
+});
+
+// =============================================================================
+// ComputedSignal Tests
+// =============================================================================
+
+void test("ComputedSignal is lazy and memoized", () => {
+  let computeCount = 0;
+  const computed = new ComputedSignal(() => {
+    computeCount++;
+    return 1 + 2;
+  });
+
+  // Lazy: callback not called until get()
+  assert.strictEqual(computeCount, 0);
+
+  // First get() computes
+  assert.strictEqual(computed.get(), 3);
+  assert.strictEqual(computeCount, 1);
+
+  // Memoized: second get() returns cached value
+  assert.strictEqual(computed.get(), 3);
+  assert.strictEqual(computeCount, 1);
+});
+
+void test("ComputedSignal tracks dependencies", () => {
+  // StateSignal dependencies
+  const a = new StateSignal(1);
+  const b = new StateSignal(2);
+  const sum = new ComputedSignal(() => a.get() + b.get());
+
+  assert.strictEqual(sum.get(), 3);
+  a.set(10);
+  assert.strictEqual(sum.get(), 12);
+  b.set(20);
+  assert.strictEqual(sum.get(), 30);
+
+  // ComputedSignal dependencies (chained)
+  const c = new StateSignal(2);
+  const doubled = new ComputedSignal(() => c.get() * 2);
+  const quadrupled = new ComputedSignal(() => doubled.get() * 2);
+
+  assert.strictEqual(quadrupled.get(), 8);
+  c.set(3);
+  assert.strictEqual(quadrupled.get(), 12);
+});
+
+void test("Dependencies can change between evaluations", () => {
+  const condition = new StateSignal(true);
+  const a = new StateSignal(1);
+  const b = new StateSignal(2);
+
+  let computeCount = 0;
+  const computed = new ComputedSignal(() => {
+    computeCount++;
+    return condition.get() ? a.get() : b.get();
+  });
+
+  assert.strictEqual(computed.get(), 1);
+  assert.strictEqual(computeCount, 1);
+
+  // Changing a should trigger recompute
+  a.set(10);
+  assert.strictEqual(computed.get(), 10);
+  assert.strictEqual(computeCount, 2);
+
+  // Changing b should NOT trigger recompute (not a dependency)
+  b.set(20);
+  assert.strictEqual(computed.get(), 10);
+  assert.strictEqual(computeCount, 2);
+
+  // Switch condition - now b is dependency, a is not
+  condition.set(false);
+  assert.strictEqual(computed.get(), 20);
+  assert.strictEqual(computeCount, 3);
+
+  // Now changing a should NOT trigger recompute
+  a.set(100);
+  assert.strictEqual(computed.get(), 20);
+  assert.strictEqual(computeCount, 3);
+
+  // But changing b should
+  b.set(200);
+  assert.strictEqual(computed.get(), 200);
+  assert.strictEqual(computeCount, 4);
+});
+
+void test("Diamond dependency pattern (glitch-free with Checking optimization)", () => {
+  //       A
+  //      / \
+  //     B   C
+  //      \ /
+  //       D
+  const a = new StateSignal(1);
+
+  let bCount = 0;
+  const b = new ComputedSignal(() => {
+    bCount++;
+    // Returns 10 for positive, 0 for non-positive
+    return a.get() > 0 ? 10 : 0;
+  });
+
+  let cCount = 0;
+  const c = new ComputedSignal(() => {
+    cCount++;
+    // Returns 20 for positive, 0 for non-positive
+    return a.get() > 0 ? 20 : 0;
+  });
+
+  let dCount = 0;
+  const d = new ComputedSignal(() => {
+    dCount++;
+    return b.get() + c.get();
+  });
+
+  // Initial computation
+  assert.strictEqual(d.get(), 30);
+  assert.strictEqual(bCount, 1);
+  assert.strictEqual(cCount, 1);
+  assert.strictEqual(dCount, 1);
+
+  // Change a, but b and c return same values - d should NOT recompute (Checking optimization)
+  a.set(2);
+  assert.strictEqual(d.get(), 30);
+  assert.strictEqual(bCount, 2);
+  assert.strictEqual(cCount, 2);
+  assert.strictEqual(dCount, 1); // d NOT recomputed
+
+  // Change a to negative - b and c return different values, d MUST recompute
+  a.set(-1);
+  assert.strictEqual(d.get(), 0);
+  assert.strictEqual(bCount, 3);
+  assert.strictEqual(cCount, 3);
+  assert.strictEqual(dCount, 2);
+});
+
+void test("Deeply nested computeds", () => {
+  const state = new StateSignal(1);
+
+  // Create a chain of 100 computeds
+  let current: StateSignal<number> | ComputedSignal<number> = state;
+  for (let i = 0; i < 100; i++) {
+    const prev: StateSignal<number> | ComputedSignal<number> = current;
+    current = new ComputedSignal(() => prev.get() + 1);
+  }
+
+  assert.strictEqual(current.get(), 101);
+
+  state.set(0);
+  assert.strictEqual(current.get(), 100);
+});
+
+// =============================================================================
+// Error Handling
+// =============================================================================
+
+void test("ComputedSignal caches and rethrows errors", () => {
+  let computeCount = 0;
+
+  const computed = new ComputedSignal(() => {
+    computeCount++;
+    throw new Error("test error");
+  });
+
+  // First call throws
+  assert.throws(() => computed.get(), { message: "test error" });
+  assert.strictEqual(computeCount, 1);
+
+  // Second call throws cached error without recomputing
+  assert.throws(() => computed.get(), { message: "test error" });
+  assert.strictEqual(computeCount, 1);
+});
+
+void test("Error cache is cleared on dependency change", () => {
+  const trigger = new StateSignal(0);
+  let shouldThrow = true;
+  let computeCount = 0;
+
+  const computed = new ComputedSignal(() => {
+    computeCount++;
+    trigger.get();
+    if (shouldThrow) throw new Error("test error");
+    return 42;
+  });
+
+  // First call throws
+  assert.throws(() => computed.get(), { message: "test error" });
+  assert.strictEqual(computeCount, 1);
+
+  // Change dependency and fix the error condition
+  shouldThrow = false;
+  trigger.set(1);
+
+  // Now should succeed
+  assert.strictEqual(computed.get(), 42);
+  assert.strictEqual(computeCount, 2);
+});
+
+void test("Circular dependency throws error", () => {
+  // Direct: a -> b -> a
+  // eslint-disable-next-line prefer-const
+  let aRef: ComputedSignal<number>;
+  const b = new ComputedSignal(() => aRef.get() + 1);
+  const a = new ComputedSignal(() => b.get() + 1);
+  aRef = a;
+
+  assert.throws(() => a.get(), { message: "Circular dependency detected" });
+
+  // Self-reference
+  // eslint-disable-next-line prefer-const
+  let selfRef: ComputedSignal<number>;
+  const self = new ComputedSignal(() => selfRef.get() + 1);
+  selfRef = self;
+
+  assert.throws(() => self.get(), { message: "Circular dependency detected" });
+});
+
+// =============================================================================
+// setTimeout Tests
+// =============================================================================
+
+void test("setTimeout outside computed behaves like regular setTimeout", async () => {
+  let called = false;
+  setTimeout(() => {
+    called = true;
+  }, 10);
+
+  assert.strictEqual(called, false);
+  await new Promise((r) => globalThis.setTimeout(r, 50));
+  assert.strictEqual(called, true);
+});
+
+void test("setTimeout inside computed fires when signal stays clean", async () => {
+  const state = new StateSignal(1);
+  let callCount = 0;
+
+  const computed = new ComputedSignal(() => {
+    state.get();
+    setTimeout(() => {
+      callCount++;
+    }, 10);
+    return "done";
+  });
+
+  computed.get();
+  assert.strictEqual(callCount, 0);
+
+  await new Promise((r) => globalThis.setTimeout(r, 50));
+  assert.strictEqual(callCount, 1);
+});
+
+void test("setTimeout inside computed cancelled when signal becomes dirty", async () => {
+  const state = new StateSignal(1);
+  let callCount = 0;
+
+  const computed = new ComputedSignal(() => {
+    state.get();
+    setTimeout(() => {
+      callCount++;
+    }, 50);
+    return "done";
+  });
+
+  computed.get();
+
+  // Make the signal dirty before timeout fires - callback skipped via _isValid
+  state.set(2);
+
+  await new Promise((r) => globalThis.setTimeout(r, 100));
+  assert.strictEqual(callCount, 0);
+
+  // Recompute schedules a new timeout, old one was already skipped
+  computed.get();
+
+  await new Promise((r) => globalThis.setTimeout(r, 100));
+  assert.strictEqual(callCount, 1);
+});
+
+void test("setTimeout with Checking state", async () => {
+  // Test: fires when Checking resolves to Clean (sources unchanged)
+  const stateA = new StateSignal(1);
+  const stateB = new StateSignal(100);
+
+  const intermediate = new ComputedSignal(() => {
+    stateA.get();
+    return "constant"; // Always returns same value
+  });
+
+  let callCount = 0;
+  const computed = new ComputedSignal(() => {
+    intermediate.get();
+    stateB.get();
+    setTimeout(() => {
+      callCount++;
+    }, 10);
+    return "done";
+  });
+
+  computed.get();
+  stateA.set(2); // intermediate recomputes but returns same value
+
+  await new Promise((r) => globalThis.setTimeout(r, 50));
+  assert.strictEqual(callCount, 1); // Fires: Checking -> Clean
+
+  // Test: cancelled when Checking resolves to Dirty (sources changed)
+  const stateC = new StateSignal(1);
+  const intermediate2 = new ComputedSignal(() => stateC.get() * 2);
+
+  let callCount2 = 0;
+  const computed2 = new ComputedSignal(() => {
+    intermediate2.get();
+    setTimeout(() => {
+      callCount2++;
+    }, 10);
+    return "done";
+  });
+
+  computed2.get();
+  stateC.set(2); // intermediate2 returns different value
+
+  await new Promise((r) => globalThis.setTimeout(r, 50));
+  assert.strictEqual(callCount2, 0); // Cancelled: Checking -> Dirty
+});
+
+void test("setTimeout passes arguments and can be manually cleared", async () => {
+  // Test argument passing
+  let receivedArgs: unknown[] = [];
+  const computed = new ComputedSignal(() => {
+    setTimeout(
+      (a: number, b: string) => {
+        receivedArgs = [a, b];
+      },
+      10,
+      42,
+      "hello",
+    );
+    return "done";
+  });
+
+  computed.get();
+  await new Promise((r) => globalThis.setTimeout(r, 50));
+  assert.deepStrictEqual(receivedArgs, [42, "hello"]);
+
+  // Test manual clearing
+  let called = false;
+  const computed2 = new ComputedSignal(() => {
+    const id = setTimeout(() => {
+      called = true;
+    }, 50);
+    globalThis.clearTimeout(id);
+    return "done";
+  });
+
+  computed2.get();
+  await new Promise((r) => globalThis.setTimeout(r, 100));
+  assert.strictEqual(called, false);
+});
+
+// =============================================================================
+// setInterval Tests
+// =============================================================================
+
+void test("setInterval outside computed behaves like regular setInterval", async () => {
+  let callCount = 0;
+  const id = setInterval(() => {
+    callCount++;
+  }, 20);
+
+  await new Promise((r) => globalThis.setTimeout(r, 70));
+  globalThis.clearInterval(id);
+
+  assert.ok(callCount >= 2, `Expected at least 2 calls, got ${callCount}`);
+});
+
+void test("setInterval inside computed stops when signal becomes dirty", async () => {
+  const state = new StateSignal(1);
+  let callCount = 0;
+
+  const computed = new ComputedSignal(() => {
+    state.get();
+    setInterval(() => {
+      callCount++;
+    }, 20);
+    return "done";
+  });
+
+  computed.get();
+
+  // Let it fire once
+  await new Promise((r) => globalThis.setTimeout(r, 30));
+  const countAfterFirst = callCount;
+  assert.ok(countAfterFirst >= 1, "Should have fired at least once");
+
+  // Make the signal dirty
+  state.set(2);
+
+  // Wait for more potential intervals
+  await new Promise((r) => globalThis.setTimeout(r, 60));
+
+  // Should not have fired again (or at most once more if timing is tight)
+  assert.ok(
+    callCount <= countAfterFirst + 1,
+    `Expected no more than ${countAfterFirst + 1} calls, got ${callCount}`,
+  );
+});
+
+void test("setInterval inside computed stops and restarts on recompute", async () => {
+  const state = new StateSignal(1);
+  let callCount = 0;
+  let intervalId: ReturnType<typeof setInterval>;
+
+  const computed = new ComputedSignal(() => {
+    const val = state.get();
+    intervalId = setInterval(() => {
+      callCount++;
+    }, 20);
+    return val;
+  });
+
+  computed.get();
+
+  // Let it fire a couple times
+  await new Promise((r) => globalThis.setTimeout(r, 50));
+  const countBeforeRecompute = callCount;
+
+  // Recompute - old interval should stop, new one should start
+  state.set(2);
+  computed.get();
+
+  await new Promise((r) => globalThis.setTimeout(r, 50));
+  globalThis.clearInterval(intervalId!);
+
+  // New interval should have fired
+  assert.ok(
+    callCount > countBeforeRecompute,
+    "New interval should have fired after recompute",
+  );
+});
+
+void test("setInterval passes arguments and can be manually cleared", async () => {
+  // Test argument passing
+  let receivedArgs: unknown[] = [];
+  const id = setInterval(
+    (a: number, b: string) => {
+      receivedArgs = [a, b];
+    },
+    10,
+    42,
+    "hello",
+  );
+
+  await new Promise((r) => globalThis.setTimeout(r, 30));
+  globalThis.clearInterval(id);
+  assert.deepStrictEqual(receivedArgs, [42, "hello"]);
+
+  // Test manual clearing
+  let callCount = 0;
+  const computed = new ComputedSignal(() => {
+    const intervalId = setInterval(() => {
+      callCount++;
+    }, 20);
+    globalThis.clearInterval(intervalId);
+    return "done";
+  });
+
+  computed.get();
+  await new Promise((r) => globalThis.setTimeout(r, 70));
+  assert.strictEqual(callCount, 0);
+});
+
+// =============================================================================
+// Disposal Tests
+// =============================================================================
+
+void test("ConstSignal disposal", () => {
+  const signal = new ConstSignal(42);
+  assert.strictEqual(signal.get(), 42);
+
+  signal[Symbol.dispose]();
+
+  // Reading after disposal throws
+  assert.throws(() => signal.get(), { message: "Cannot read disposed signal" });
+
+  // Disposing again is a no-op (doesn't throw)
+  signal[Symbol.dispose]();
+});
+
+void test("StateSignal disposal", () => {
+  const signal = new StateSignal(42);
+  assert.strictEqual(signal.get(), 42);
+
+  signal[Symbol.dispose]();
+
+  // Reading after disposal throws
+  assert.throws(() => signal.get(), { message: "Cannot read disposed signal" });
+
+  // Writing after disposal throws
+  assert.throws(() => signal.set(100), {
+    message: "Cannot write to disposed signal",
+  });
+
+  // Disposing again is a no-op (doesn't throw)
+  signal[Symbol.dispose]();
+});
+
+void test("ComputedSignal disposal", () => {
+  const state = new StateSignal(1);
+  let computeCount = 0;
+
+  const computed = new ComputedSignal(() => {
+    computeCount++;
+    return state.get() * 2;
+  });
+
+  assert.strictEqual(computed.get(), 2);
+  assert.strictEqual(computeCount, 1);
+
+  computed[Symbol.dispose]();
+
+  // Reading after disposal throws
+  assert.throws(() => computed.get(), {
+    message: "Cannot read disposed signal",
+  });
+
+  // Disposing again is a no-op (doesn't throw)
+  computed[Symbol.dispose]();
+
+  // Source state still works
+  assert.strictEqual(state.get(), 1);
+});
+
+void test("ComputedSignal disposal detaches from sources", () => {
+  const state = new StateSignal(1);
+  let computeCount = 0;
+
+  const computed = new ComputedSignal(() => {
+    computeCount++;
+    return state.get() * 2;
+  });
+
+  assert.strictEqual(computed.get(), 2);
+  assert.strictEqual(computeCount, 1);
+
+  // Verify sink is registered
+  assert.strictEqual((state as any)._sinks.size, 1);
+
+  computed[Symbol.dispose]();
+
+  // Sink should be removed after disposal
+  assert.strictEqual((state as any)._sinks.size, 0);
+});
+
+void test("ComputedSignal disposal runs cleanups", async () => {
+  let timeoutFired = false;
+  let intervalFired = false;
+
+  const computed = new ComputedSignal(() => {
+    setTimeout(() => {
+      timeoutFired = true;
+    }, 10);
+    setInterval(() => {
+      intervalFired = true;
+    }, 10);
+    return "done";
+  });
+
+  computed.get();
+  computed[Symbol.dispose]();
+
+  // Wait for timers that would have fired
+  await new Promise((r) => globalThis.setTimeout(r, 50));
+
+  // Neither should have fired because disposal cleared them
+  assert.strictEqual(timeoutFired, false);
+  assert.strictEqual(intervalFired, false);
+});
+
+void test("Disposal cascades to nested signals of all types", () => {
+  let innerState: StateSignal<number> | null = null;
+  let innerConst: ConstSignal<number> | null = null;
+  let innerComputed: ComputedSignal<number> | null = null;
+
+  const outer = new ComputedSignal(() => {
+    innerState = new StateSignal(10);
+    innerConst = new ConstSignal(20);
+    innerComputed = new ComputedSignal(() => 30);
+    return innerState.get() + innerConst.get() + innerComputed.get();
+  });
+
+  assert.strictEqual(outer.get(), 60);
+
+  outer[Symbol.dispose]();
+
+  assert.throws(() => innerState!.get(), {
+    message: "Cannot read disposed signal",
+  });
+  assert.throws(() => innerConst!.get(), {
+    message: "Cannot read disposed signal",
+  });
+  assert.throws(() => innerComputed!.get(), {
+    message: "Cannot read disposed signal",
+  });
+});
+
+// =============================================================================
+// Watcher Tests
+// =============================================================================
+
+void test("Watcher notifies on state change and at most once per batch", () => {
+  const state = new StateSignal(1);
+  let notifyCount = 0;
+  const watcher = new Watcher(() => {
+    notifyCount++;
+  });
+  watcher.watch(state);
+
+  // Fires on change
+  state.set(2);
+  assert.strictEqual(notifyCount, 1);
+
+  // At-most-once: second change in same batch does not fire again
+  state.set(3);
+  assert.strictEqual(notifyCount, 1);
+
+  // watch() resets the flag, allowing notification again
+  watcher.watch(state);
+  state.set(4);
+  assert.strictEqual(notifyCount, 2);
+
+  watcher[Symbol.dispose]();
+});
+
+void test("Watcher notifies on transitive dependency change", () => {
+  const state = new StateSignal(1);
+  const computed = new ComputedSignal(() => state.get() * 2);
+  let notifyCount = 0;
+  const watcher = new Watcher(() => {
+    notifyCount++;
+  });
+
+  // Prime the computed so it registers dependencies and is Clean
+  computed.get();
+  watcher.watch(computed);
+
+  // Changing the root state propagates through the computed to the watcher
+  state.set(2);
+  assert.strictEqual(notifyCount, 1);
+
+  watcher[Symbol.dispose]();
+});
+
+void test("Watcher unwatch and disposal stop notifications", () => {
+  const a = new StateSignal(1);
+  const b = new StateSignal(1);
+  let notifyCount = 0;
+  const watcher = new Watcher(() => {
+    notifyCount++;
+  });
+  watcher.watch(a, b);
+
+  // Unwatch a, changes to a no longer notify
+  watcher.unwatch(a);
+  a.set(2);
+  assert.strictEqual(notifyCount, 0);
+
+  // b still notifies
+  b.set(2);
+  assert.strictEqual(notifyCount, 1);
+
+  // After disposal, nothing notifies
+  watcher.watch(b); // reset notified flag
+  watcher[Symbol.dispose]();
+  b.set(3);
+  assert.strictEqual(notifyCount, 1);
+});
+
+void test("Watcher getPending returns dirty computed signals", () => {
+  const state = new StateSignal(1);
+  const computed = new ComputedSignal(() => state.get() * 2);
+
+  // Prime the computed so it has registered dependencies
+  computed.get();
+
+  const watcher = new Watcher(() => {});
+  watcher.watch(computed);
+
+  // Before any change, nothing is pending
+  assert.deepStrictEqual(watcher.getPending(), []);
+
+  // After change, computed is pending
+  state.set(2);
+  assert.deepStrictEqual(watcher.getPending(), [computed]);
+
+  // After reading, no longer pending
+  computed.get();
+  assert.deepStrictEqual(watcher.getPending(), []);
+
+  watcher[Symbol.dispose]();
+});
+
+void test("markSinksDirty handles computed re-adding itself during recomputation", () => {
+  // When iterating a Set and an element is removed then re-added during iteration,
+  // it may be encountered again. Verify computed signals don't recompute twice.
+
+  const source = new StateSignal(0);
+  let computeCount = 0;
+
+  const computed = new ComputedSignal(() => {
+    computeCount++;
+    return source.get() * 2;
+  });
+
+  // Prime the computed
+  assert.strictEqual(computed.get(), 0);
+  assert.strictEqual(computeCount, 1);
+
+  // Set up a watcher that recomputes on change
+  const watcher = new Watcher(() => {
+    computed.get();
+    watcher.watch(computed);
+  });
+  watcher.watch(computed);
+
+  // Change the source - this should NOT cause infinite recomputation
+  source.set(1);
+
+  // Should have recomputed exactly once (not infinitely)
+  assert.strictEqual(computeCount, 2);
+  assert.strictEqual(computed.get(), 2);
+  assert.strictEqual(computeCount, 2); // Still 2, no extra recompute
+
+  watcher[Symbol.dispose]();
+});
+
+void test("Watcher callback does not register dependencies on the current computed", () => {
+  // Verify signal reads inside a Watcher callback don't accidentally register as
+  // dependencies of the ComputedSignal currently being evaluated. Watchers observe
+  // "from outside" the reactive graph.
+
+  const triggerSignal = new StateSignal(0); // X - triggers A's recomputation
+  const sideEffectSignal = new StateSignal("initial"); // Y - set inside A, triggers W
+  const unrelatedSignal = new StateSignal(100); // Z - read by W, should NOT become dep of A
+
+  let watcherCallCount = 0;
+  let watcherReadValue: number | null = null;
+
+  const watcher = new Watcher(() => {
+    watcherCallCount++;
+    watcherReadValue = unrelatedSignal.get();
+    watcher.watch(sideEffectSignal);
+  });
+  watcher.watch(sideEffectSignal);
+
+  let computeCount = 0;
+
+  // ComputedSignal that sets sideEffectSignal (triggering watcher) during computation
+  const computedA = new ComputedSignal(() => {
+    computeCount++;
+    const val = triggerSignal.get();
+    // This set() will synchronously notify the watcher
+    sideEffectSignal.set(`computed-${val}`);
+    return val * 2;
+  });
+
+  assert.strictEqual(computedA.get(), 0);
+  assert.strictEqual(computeCount, 1);
+  assert.strictEqual(watcherCallCount, 1);
+  assert.strictEqual(watcherReadValue, 100);
+
+  unrelatedSignal.set(200);
+  assert.strictEqual(computedA.get(), 0);
+  assert.strictEqual(computeCount, 1);
+
+  triggerSignal.set(5);
+  assert.strictEqual(computedA.get(), 10);
+  assert.strictEqual(computeCount, 2);
+
+  watcher[Symbol.dispose]();
+});
+
+// =============================================================================
+// equals comparator (TC39 Signals `equals` hook)
+// =============================================================================
+
+void test("StateSignal custom equals makes equal-deemed writes a no-op", () => {
+  const signal = new StateSignal<number[]>([1, 2], {
+    equals: (prev, next) => prev.length === next.length,
+  });
+
+  let computeCount = 0;
+  const computed = new ComputedSignal(() => {
+    computeCount++;
+    return signal.get();
+  });
+
+  const first = computed.get();
+  assert.deepStrictEqual(first, [1, 2]);
+  assert.strictEqual(computeCount, 1);
+
+  // Same length → comparator deems it equal: no update, no notification,
+  // prior reference kept
+  signal.set([3, 4]);
+  assert.strictEqual(computed.get(), first);
+  assert.strictEqual(computeCount, 1);
+
+  // Different length → genuine write
+  signal.set([1, 2, 3]);
+  assert.deepStrictEqual(computed.get(), [1, 2, 3]);
+  assert.strictEqual(computeCount, 2);
+});
+
+void test("ComputedSignal custom equals keeps prior reference and silences dependents", () => {
+  const source = new StateSignal(0);
+
+  let derivedRuns = 0;
+  const derived = new ComputedSignal<number[]>(
+    () => {
+      derivedRuns++;
+      return [Math.floor(source.get() / 10)];
+    },
+    { equals: (prev, next) => prev[0] === next[0] },
+  );
+
+  let sinkRuns = 0;
+  const sink = new ComputedSignal(() => {
+    sinkRuns++;
+    return derived.get();
+  });
+
+  const v1 = sink.get();
+  assert.deepStrictEqual(v1, [0]);
+  assert.strictEqual(derivedRuns, 1);
+  assert.strictEqual(sinkRuns, 1);
+
+  // derived recomputes to a fresh [0]; equals reports unchanged, so derived
+  // keeps the prior array reference and the sink never re-enters its body
+  source.set(5);
+  const v2 = sink.get();
+  assert.strictEqual(derivedRuns, 2);
+  assert.strictEqual(sinkRuns, 1, "dependent must not recompute");
+  assert.strictEqual(v2, v1, "prior reference must be kept");
+
+  // A genuine change propagates
+  source.set(15);
+  const v3 = sink.get();
+  assert.strictEqual(derivedRuns, 3);
+  assert.strictEqual(sinkRuns, 2);
+  assert.deepStrictEqual(v3, [1]);
+});
+
+void test("ComputedSignal custom equals notifies watchers only on genuine change", () => {
+  const source = new StateSignal(0);
+  const derived = new ComputedSignal<number[]>(
+    () => [Math.floor(source.get() / 10)],
+    { equals: (prev, next) => prev[0] === next[0] },
+  );
+
+  let notifications = 0;
+  const watcher = new Watcher(() => {
+    notifications++;
+  });
+  watcher.watch(derived);
+  derived.get();
+
+  // The watcher is notified when derived is marked (it cannot know yet
+  // whether the recomputed value will be equal)...
+  source.set(5);
+  assert.strictEqual(notifications, 1);
+  // ...but pulling the value re-arms nothing downstream: the recompute kept
+  // the prior reference, so dependents added later still see stable identity
+  const before = derived.get();
+  watcher.watch(derived); // re-arm
+  source.set(7);
+  derived.get();
+  assert.strictEqual(derived.get(), before);
+
+  watcher[Symbol.dispose]();
+});
+
+// =============================================================================
+// Ambient cleanup owner (runWithCleanupOwner / currentCleanupOwner)
+// =============================================================================
+
+void test("registerCleanup drops when there is no live owner (absent or disposed)", () => {
+  let cleaned = false;
+  const drop = (): void => {
+    cleaned = true;
+  };
+
+  // No owner in force.
+  assert.strictEqual(registerCleanup(drop), false);
+  assert.strictEqual(currentCleanupOwner(), null);
+
+  // Owner present but already disposed.
+  const disposed = new ComputedSignal<unknown>(() => null);
+  disposed[Symbol.dispose]();
+  assert.strictEqual(
+    runWithCleanupOwner(disposed, () => registerCleanup(drop)),
+    false,
+  );
+  assert.strictEqual(cleaned, false);
+});
+
+void test("registerCleanup anchors to the ambient owner and runs on disposal", () => {
+  const owner = new ComputedSignal<unknown>(() => null);
+  let cleaned = false;
+
+  const anchored = runWithCleanupOwner(owner, () =>
+    registerCleanup(() => {
+      cleaned = true;
+    }),
+  );
+  assert.strictEqual(anchored, true);
+  assert.strictEqual(currentCleanupOwner(), null); // restored after the block
+
+  assert.strictEqual(cleaned, false);
+  owner[Symbol.dispose]();
+  assert.strictEqual(cleaned, true);
+});
+
+void test("runWithCleanupOwner anchors cleanups without tracking dependencies", () => {
+  const owner = new ComputedSignal<unknown>(() => null);
+  owner.get(); // make it Clean/valid
+  const state = new StateSignal(1);
+
+  runWithCleanupOwner(owner, () => {
+    // Reading a signal here must NOT make `owner` depend on it.
+    state.get();
+    registerCleanup(() => {});
+  });
+
+  // If a dependency had been registered, owner would be among state's sinks.
+  assert.strictEqual((state as any)._sinks.size, 0);
+});
+
+void test("a signal's constructor self-anchor is dropped under a disposed owner", () => {
+  // Computed/State/Const constructors anchor their own disposal via
+  // registerCleanup. Under a LIVE owner that anchors (control: the child is
+  // disposed when the owner is); under an already-disposed owner the _disposed
+  // gate makes that registerCleanup return false, so the anchor is dropped and
+  // the new signal stays independent rather than being re-anchored to a dead owner.
+  const liveOwner = new ComputedSignal<unknown>(() => null);
+  const anchored = runWithCleanupOwner(
+    liveOwner,
+    () => new ComputedSignal(() => 1),
+  );
+  liveOwner[Symbol.dispose]();
+  assert.throws(() => anchored.get(), /disposed/); // anchored → disposed with owner
+
+  const deadOwner = new ComputedSignal<unknown>(() => null);
+  deadOwner[Symbol.dispose]();
+  const dropped = runWithCleanupOwner(
+    deadOwner,
+    () => new ComputedSignal(() => 2),
+  );
+  assert.strictEqual(dropped.get(), 2); // anchor dropped → still alive
+});
+
+void test("setTimeout re-establishes the owner so callback cleanups anchor", async () => {
+  const state = new StateSignal(1);
+  let cleaned = false;
+
+  const computed = new ComputedSignal(() => {
+    state.get();
+    setTimeout(() => {
+      // Runs on a later turn with `computing` null; the wrapper re-establishes
+      // the owner, so this addEventListener-style cleanup anchors to `computed`.
+      registerCleanup(() => {
+        cleaned = true;
+      });
+    }, 10);
+    return "done";
+  });
+
+  computed.get();
+  await new Promise((r) => globalThis.setTimeout(r, 50));
+  assert.strictEqual(cleaned, false); // still alive — not yet disposed
+
+  computed[Symbol.dispose]();
+  assert.strictEqual(cleaned, true); // cleanup registered in the callback ran
+});
+
+void test("a timer callback does not track dependencies of the owner", async () => {
+  const trigger = new StateSignal(0);
+  const readInCallback = new StateSignal(0);
+  let runs = 0;
+
+  const computed = new ComputedSignal(() => {
+    trigger.get();
+    setTimeout(() => {
+      readInCallback.get(); // must not register a dependency
+    }, 10);
+    runs++;
+    return null;
+  });
+
+  computed.get();
+  await new Promise((r) => globalThis.setTimeout(r, 50));
+  assert.strictEqual(runs, 1);
+
+  // Changing what the callback read must not invalidate the computed.
+  readInCallback.set(1);
+  computed.get();
+  assert.strictEqual(runs, 1);
+});
+
+void test("a nested timer inherits the ambient owner and auto-clears", async () => {
+  const state = new StateSignal(1);
+  let inner = 0;
+
+  const computed = new ComputedSignal(() => {
+    state.get();
+    setTimeout(() => {
+      // Scheduled with `computing` null; the outer wrapper re-established the
+      // owner, so this inner interval anchors to `computed` and is cleared on
+      // disposal instead of leaking.
+      setInterval(() => {
+        inner++;
+      }, 10);
+    }, 10);
+    return null;
+  });
+
+  computed.get();
+  await new Promise((r) => globalThis.setTimeout(r, 60));
+  const seen = inner;
+  assert.ok(seen >= 1, "nested interval fired");
+
+  computed[Symbol.dispose]();
+  await new Promise((r) => globalThis.setTimeout(r, 40));
+  assert.strictEqual(inner, seen); // interval cleared on owner disposal
+});
+
+void test("abortSignal with no owner never aborts", () => {
+  const sig = abortSignal();
+  assert.strictEqual(sig.aborted, false);
+  assert.strictEqual(currentCleanupOwner(), null);
+});
+
+void test("abortSignal resolves the ambient owner and aborts on disposal", () => {
+  const owner = new ComputedSignal<unknown>(() => null);
+  const sig = runWithCleanupOwner(owner, () => abortSignal());
+  assert.strictEqual(sig.aborted, false); // live owner
+  owner[Symbol.dispose]();
+  assert.strictEqual(sig.aborted, true); // aborted on owner disposal
+});

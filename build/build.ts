@@ -6,6 +6,7 @@ import { exec } from "node:child_process";
 import * as esbuild from "esbuild";
 import { optimize } from "svgo";
 import * as xmlParser from "../lib/xml-parser.ts";
+import type { Element } from "../lib/xml-parser.ts";
 
 const fsAsync = {
   readdir: promisify(fs.readdir),
@@ -40,28 +41,37 @@ async function rmDir(dirPath: string): Promise<void> {
   await fsAsync.rmdir(dirPath);
 }
 
+interface LockfileV1Node {
+  dev?: boolean;
+  dependencies?: Record<string, LockfileV1Node>;
+}
+
 // For lockfileVersion = 1
-function stripDevDeps(deps): void {
-  if (!deps["dependencies"]) return;
-  for (const [k, v] of Object.entries(deps["dependencies"])) {
-    if (v["dev"]) delete deps["dependencies"][k];
+function stripDevDeps(deps: LockfileV1Node): void {
+  if (!deps.dependencies) return;
+  for (const [k, v] of Object.entries(deps.dependencies)) {
+    if (v.dev) delete deps.dependencies[k];
     else stripDevDeps(v);
   }
-  if (!Object.keys(deps["dependencies"]).length) delete deps["dependencies"];
+  if (!Object.keys(deps.dependencies).length) delete deps.dependencies;
+}
+
+interface LockfileV2 {
+  packages?: Record<string, { dev?: boolean; devDependencies?: unknown }>;
 }
 
 // For lockfileVersion = 2
-function stripDevDeps2(deps): void {
-  if (!deps["packages"]) return;
-  for (const [k, v] of Object.entries(deps["packages"])) {
-    delete v["devDependencies"];
-    if (v["dev"]) delete deps["packages"][k];
+function stripDevDeps2(deps: LockfileV2): void {
+  if (!deps.packages) return;
+  for (const [k, v] of Object.entries(deps.packages)) {
+    delete v.devDependencies;
+    if (v.dev) delete deps.packages[k];
   }
 }
 
-function xmlTostring(xml): string {
+function xmlToString(xml: Element): string {
   const children = [];
-  for (const c of xml.children || []) children.push(xmlTostring(c));
+  for (const c of xml.children || []) children.push(xmlToString(c));
 
   return xml.name === "root" && xml.bodyIndex === 0
     ? children.join("")
@@ -92,6 +102,19 @@ const assetsPlugin = {
   },
 } as esbuild.Plugin;
 
+const seedPlugin = {
+  name: "seed",
+  setup(build) {
+    build.onLoad({ filter: /\/seed\// }, (args) => {
+      if (args.with?.["type"] !== "text") return undefined;
+      let contents = fs.readFileSync(args.path, "utf8");
+      // Strip TypeScript directives that are only needed for type-checking
+      contents = contents.replace(/^\s*\/\/\s*@ts-.*\n/gm, "\n");
+      return { contents, loader: "text" };
+    });
+  },
+} as esbuild.Plugin;
+
 const packageDotJsonPlugin = {
   name: "packageDotJson",
   setup(build) {
@@ -107,15 +130,25 @@ const packageDotJsonPlugin = {
 const inlineDepsPlugin = {
   name: "inlineDeps",
   setup(build) {
-    const deps = [
-      "parsimmon",
-      "espresso-iisojs",
-      "codemirror",
-      "mithril",
-      "yaml",
-    ];
+    const deps = ["espresso-iisojs", "@codemirror", "yaml"];
+    const depFiles = new Set();
     build.onResolve({ filter: /^[^.]/ }, async (args) => {
-      if (deps.some((d) => args.path.startsWith(d))) return undefined;
+      if (args.pluginData === "inlineDeps") return undefined;
+      if (
+        depFiles.has(args.importer) ||
+        deps.some((d) => args.path.startsWith(d))
+      ) {
+        const res = await build.resolve(args.path, {
+          importer: args.importer,
+          namespace: args.namespace,
+          resolveDir: args.resolveDir,
+          kind: args.kind,
+          with: args.with,
+          pluginData: "inlineDeps",
+        });
+        depFiles.add(res.path);
+        return res;
+      }
       return { sideEffects: false, external: true };
     });
   },
@@ -133,7 +166,7 @@ function generateSymbol(id: string, svgStr: string): string {
     }
   }
   const symbolBody = xml.children[0].children
-    .map((c) => xmlTostring(c))
+    .map((c) => xmlToString(c))
     .join("");
   return `<symbol id="icon-${id}" ${viewBox}>${symbolBody}</symbol>`;
 }
@@ -226,6 +259,16 @@ async function copyStatic(): Promise<void> {
 }
 
 async function generateCss(): Promise<void> {
+  const tailwindPlugin = {
+    name: "tailwind",
+    setup(build) {
+      build.onLoad({ filter: /\/ui\/css\/app.css$/ }, async (args) => {
+        const res = await execAsync(`npx @tailwindcss/cli -i ${args.path}`);
+        return { loader: "css", contents: res.stdout };
+      });
+    },
+  } as esbuild.Plugin;
+
   const res = await esbuild.build({
     bundle: true,
     absWorkingDir: INPUT_DIR,
@@ -235,7 +278,11 @@ async function generateCss(): Promise<void> {
     entryPoints: ["ui/css/app.css"],
     entryNames: "[dir]/[name]-[hash]",
     outfile: path.join(OUTPUT_DIR, "public/app.css"),
-    target: ["chrome109", "safari15.6", "firefox115", "opera102", "edge118"],
+    plugins: [tailwindPlugin],
+    loader: {
+      ".woff2": "dataurl",
+    },
+    target: ["chrome111", "safari16.4", "firefox128"],
     metafile: true,
   });
 
@@ -263,6 +310,9 @@ async function generateBackendJs(): Promise<void> {
     bundle: true,
     absWorkingDir: INPUT_DIR,
     minify: MODE === "production",
+    define: {
+      "process.env.NODE_ENV": JSON.stringify(MODE),
+    },
     sourcemap: "inline",
     sourcesContent: false,
     platform: "node",
@@ -271,7 +321,7 @@ async function generateBackendJs(): Promise<void> {
     banner: { js: "#!/usr/bin/env node" },
     entryPoints: services.map((s) => `bin/${s}.ts`),
     outdir: path.join(OUTPUT_DIR, "bin"),
-    plugins: [packageDotJsonPlugin, assetsPlugin],
+    plugins: [packageDotJsonPlugin, assetsPlugin, seedPlugin],
   });
 
   for (const bin of services) {
@@ -293,7 +343,7 @@ async function generateFrontendJs(): Promise<void> {
     sourcesContent: false,
     platform: "browser",
     format: "esm",
-    target: ["chrome109", "safari15.6", "firefox115", "opera102", "edge118"],
+    target: ["chrome111", "safari16.4", "firefox128"],
     entryPoints: ["ui/app.ts"],
     entryNames: "[dir]/[name]-[hash]",
     outdir: path.join(OUTPUT_DIR, "public"),
@@ -303,7 +353,8 @@ async function generateFrontendJs(): Promise<void> {
 
   for (const [k, v] of Object.entries(res.metafile.outputs)) {
     for (const imp of v.imports)
-      if (imp.external) throw new Error(`External import found: ${imp.path}`);
+      if (imp.external && imp.path !== "views-bundle")
+        throw new Error(`External import found: ${imp.path}`);
 
     if (v.entryPoint === "ui/app.ts") {
       ASSETS.APP_JS = path.relative(

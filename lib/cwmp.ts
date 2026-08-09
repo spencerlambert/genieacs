@@ -10,11 +10,7 @@ import * as config from "./config.ts";
 import { generateDeviceId, once, setTimeoutPromise } from "./util.ts";
 import * as soap from "./soap.ts";
 import * as session from "./session.ts";
-import {
-  evaluateAsync,
-  evaluate,
-  extractParams,
-} from "./common/expression/util.ts";
+import Expression, { Value } from "./common/expression.ts";
 import * as cache from "./cache.ts";
 import * as lock from "./lock.ts";
 import * as localCache from "./cwmp/local-cache.ts";
@@ -39,12 +35,13 @@ import {
   AcsRequest,
   SessionFault,
   Fault,
-  Expression,
   SoapMessage,
   InformRequest,
   Preset,
   GetRPCMethodsResponse,
   CpeFault,
+  Declaration,
+  TransferCompleteRequest,
 } from "./types.ts";
 import { parseXmlDeclaration } from "./xml-parser.ts";
 import * as debug from "./debug.ts";
@@ -56,7 +53,7 @@ const deflatePromisified = promisify(zlib.deflate);
 
 const REALM = "GenieACS";
 const MAX_CYCLES = 4;
-const MAX_CONCURRENT_REQUESTS = +config.get("MAX_CONCURRENT_REQUESTS");
+const MAX_CONCURRENT_REQUESTS = Number(config.get("MAX_CONCURRENT_REQUESTS"));
 
 const MAX_SESSION_DURATION = 300000;
 const LOCK_REFRESH_INTERVAL = 10000;
@@ -80,16 +77,16 @@ async function authenticate(
     sessionContext.cacheSnapshot,
     "cwmp.auth",
   );
-  if (authExpression == null) return true;
+  if (!authExpression) return true;
 
-  let authentication;
+  let authentication: auth.AuthorizationHeader | undefined;
 
   if (sessionContext.httpRequest.headers["authorization"]) {
     try {
       authentication = auth.parseAuthorizationHeader(
         sessionContext.httpRequest.headers["authorization"],
       );
-    } catch (err) {
+    } catch {
       return false;
     }
   }
@@ -107,69 +104,78 @@ async function authenticate(
     authentication["body"] = body;
   }
 
-  const res = await evaluateAsync(
-    authExpression,
-    {},
-    sessionContext.timestamp,
+  const res = await authExpression.evaluateAsync(
     async (e: Expression): Promise<Expression> => {
       e = session.configContextCallback(sessionContext, e);
-      if (Array.isArray(e) && e[0] === "FUNC") {
-        if (e[1] === "EXT") {
-          if (typeof e[2] !== "string" || typeof e[3] !== "string") return null;
+      if (e instanceof Expression.Parameter)
+        return new Expression.Literal(null);
 
-          for (let i = 4; i < e.length; i++)
-            if (Array.isArray(e[i])) return null;
+      if (e instanceof Expression.FunctionCall) {
+        if (e.name === "NOW")
+          return new Expression.Literal(sessionContext.timestamp);
+        if (e.name === "EXT") {
+          if (!e.args.every((a) => a instanceof Expression.Literal))
+            return new Expression.Literal(null);
 
-          const { fault, value } = await extensions.run(e.slice(2));
-          return fault ? null : value;
-        } else if (e[1] === "AUTH") {
-          const username = e[2];
-          const password = e[3];
-          if (username != null && password != null && authentication) {
-            if (authentication["method"] === "Basic") {
-              return (
-                authentication["username"] === e[2] &&
-                authentication["password"] === e[3]
-              );
-            }
+          const args = e.args.map((a) => a.value?.toString() ?? "");
+          if (typeof args[0] !== "string" || typeof args[1] !== "string")
+            return new Expression.Literal(null);
 
-            if (authentication["method"] === "Digest") {
-              const expected = auth.digest(
-                username,
-                REALM,
-                password,
-                authentication["nonce"],
-                "POST",
-                authentication["uri"],
-                authentication["qop"],
-                authentication["body"],
-                authentication["cnonce"],
-                authentication["nc"],
-              );
-              return expected === authentication["response"];
+          const { fault, value } = await extensions.run(args);
+          if (fault) return new Expression.Literal(null);
+          return new Expression.Literal(value);
+        } else if (e.name === "AUTH") {
+          if (e.args.every((a) => a instanceof Expression.Literal)) {
+            const username = e.args[0].value;
+            const password = e.args[1].value;
+            if (username != null && password != null && authentication) {
+              if (authentication["method"] === "Basic") {
+                return new Expression.Literal(
+                  authentication["username"] === username.toString() &&
+                    authentication["password"] === password.toString(),
+                );
+              }
+
+              if (authentication["method"] === "Digest") {
+                const expected = auth.digest(
+                  username.toString(),
+                  REALM,
+                  password.toString(),
+                  authentication["nonce"] ?? "",
+                  "POST",
+                  authentication["uri"] ?? "",
+                  authentication["qop"],
+                  body,
+                  authentication["cnonce"],
+                  authentication["nc"],
+                );
+                return new Expression.Literal(
+                  expected === authentication["response"],
+                );
+              }
             }
           }
-          return false;
+          return new Expression.Literal(false);
         }
       }
       return e;
     },
   );
 
-  if (res && !Array.isArray(res)) return true;
+  if (res instanceof Expression.Literal) return !!res.value;
 
   return false;
 }
 
 async function writeResponse(
   sessionContext: SessionContext,
-  res,
+  res: { code: number; headers: Record<string, string>; data: string },
   close = false,
 ): Promise<void> {
   // Close connection after last request in session
   if (close) res.headers["Connection"] = "close";
 
-  let data = res.data;
+  let data: string | Buffer = res.data;
 
   // Respond using the same content-encoding as the request
   if (
@@ -226,20 +232,18 @@ async function writeResponse(
 function recordFault(
   sessionContext: SessionContext,
   fault: Fault,
-  provisions,
-  channels,
+  provisions: [string, ...Value[]][],
+  channels: { [channel: string]: number },
 ): void;
 function recordFault(sessionContext: SessionContext, fault: Fault): void;
 function recordFault(
   sessionContext: SessionContext,
   fault: Fault,
-  provisions?,
-  channels?,
+  provisions?: [string, ...Value[]][],
+  channels?: { [channel: string]: number },
 ): void {
-  if (!provisions) {
-    provisions = sessionContext.provisions;
-    channels = sessionContext.channels;
-  }
+  if (!provisions) provisions = sessionContext.provisions;
+  if (!channels) channels = sessionContext.channels;
 
   const channelKeys = Object.keys(channels);
   if (!channelKeys.length)
@@ -269,7 +273,6 @@ function recordFault(
 
     if (channels[channel] === 0) faults[channel].precondition = true;
 
-    if (!sessionContext.faultsTouched) sessionContext.faultsTouched = {};
     sessionContext.faultsTouched[channel] = true;
 
     logger.accessWarn({
@@ -315,8 +318,7 @@ async function inform(
   const cookiesPath = localCache.getConfig(
     sessionContext.cacheSnapshot,
     "cwmp.cookiesPath",
-    {},
-    sessionContext.timestamp,
+    "",
     (e) => session.configContextCallback(sessionContext, e),
   );
 
@@ -330,10 +332,13 @@ async function inform(
   return res;
 }
 
-async function transferComplete(sessionContext, rpc): Promise<void> {
+async function transferComplete(
+  sessionContext: SessionContext,
+  rpc: SoapMessage,
+): Promise<void> {
   const { acsResponse, operation, fault } = await session.transferComplete(
     sessionContext,
-    rpc.cpeRequest,
+    rpc.cpeRequest as TransferCompleteRequest,
   );
 
   if (!operation) {
@@ -344,7 +349,7 @@ async function transferComplete(sessionContext, rpc): Promise<void> {
     });
   }
 
-  if (fault) {
+  if (fault && operation) {
     Object.assign(sessionContext.retries, operation.retries);
     recordFault(
       sessionContext,
@@ -364,7 +369,7 @@ async function transferComplete(sessionContext, rpc): Promise<void> {
 }
 
 // Append provisions and remove duplicates
-function appendProvisions(original, toAppend): boolean {
+function appendProvisions(original: any[], toAppend: any[]): boolean {
   let modified = false;
   const stringified = new WeakMap();
 
@@ -400,53 +405,50 @@ async function applyPresets(sessionContext: SessionContext): Promise<void> {
   const presets = localCache.getPresets(sessionContext.cacheSnapshot);
 
   // Filter presets based on existing faults
-  const blackList = {};
-  let whiteList = null;
-  let whiteListProvisions = null;
-  const RETRY_DELAY = +localCache.getConfig(
-    sessionContext.cacheSnapshot,
-    "cwmp.retryDelay",
-    {},
-    sessionContext.timestamp,
-    (e) => session.configContextCallback(sessionContext, e),
+  const blackList: Record<string, number> = {};
+  let whiteList: [string, [string, ...Value[]][]] | null = null;
+  const RETRY_DELAY = Number(
+    localCache.getConfig(
+      sessionContext.cacheSnapshot,
+      "cwmp.retryDelay",
+      300,
+      (e) => session.configContextCallback(sessionContext, e),
+    ),
   );
 
-  if (sessionContext.faults) {
-    for (const [channel, fault] of Object.entries(sessionContext.faults)) {
-      let retryTimestamp = 0;
-      if (!fault.retryNow) {
-        retryTimestamp =
-          fault.timestamp +
-          RETRY_DELAY * Math.pow(2, sessionContext.retries[channel]) * 1000;
-      }
-
-      if (retryTimestamp <= sessionContext.timestamp) {
-        whiteList = channel;
-        whiteListProvisions = fault.provisions;
-        break;
-      }
-
-      blackList[channel] = fault.precondition ? 1 : 2;
+  for (const [channel, fault] of Object.entries(sessionContext.faults)) {
+    let retryTimestamp = 0;
+    if (!fault.retryNow) {
+      retryTimestamp =
+        fault.timestamp +
+        RETRY_DELAY * Math.pow(2, sessionContext.retries[channel]) * 1000;
     }
+
+    if (retryTimestamp <= sessionContext.timestamp) {
+      whiteList = [channel, fault.provisions];
+      break;
+    }
+
+    blackList[channel] = fault.precondition ? 1 : 2;
   }
 
   deviceData.timestamps.revision = 1;
   deviceData.attributes.revision = 1;
 
-  const deviceEvents = {};
-  for (const p of deviceData.paths.find(Path.parse("Events.*"), false, true)) {
+  const deviceEvents: Record<string, boolean> = {};
+  for (const p of deviceData.paths.find(Path.parse("Events"), 0b001, 0b1)) {
     const attrs = deviceData.attributes.get(p);
-    const t = attrs?.value[1][0] as number;
+    const t = attrs?.value?.[1]?.[0] as number;
     if (t >= sessionContext.timestamp)
       deviceEvents[p.segments[1] as string] = true;
   }
 
-  const parameters: { [name: string]: Path } = {};
+  const parameters = new Set<string>();
   const filteredPresets: Preset[] = [];
 
   for (const preset of presets) {
     if (whiteList != null) {
-      if (preset.channel !== whiteList) continue;
+      if (preset.channel !== whiteList[0]) continue;
     } else if (blackList[preset.channel] === 1) {
       continue;
     }
@@ -470,35 +472,39 @@ async function applyPresets(sessionContext: SessionContext): Promise<void> {
         continue;
     }
 
-    filteredPresets.push(preset);
-    for (const k of extractParams(
-      evaluate(preset.precondition, null, sessionContext.timestamp),
-    )) {
-      // Mark channel in case of fault during fetching precondition
-      sessionContext.channels[preset.channel] = 0;
-      if (typeof k === "string") parameters[k] = Path.parse(k);
-    }
-    for (const prov of preset.provisions) {
-      for (const arg of prov.slice(1)) {
-        for (const k of extractParams(
-          evaluate(arg, null, sessionContext.timestamp),
-        )) {
-          // Mark channel in case of fault during fetching precondition
-          sessionContext.channels[preset.channel] = 0;
-          if (typeof k === "string") parameters[k] = Path.parse(k);
-        }
+    const pre = { ...preset };
+    const evalCallback = (e: Expression): Expression => {
+      if (e instanceof Expression.FunctionCall && e.name === "NOW")
+        return new Expression.Literal(sessionContext.timestamp);
+      if (e instanceof Expression.Parameter) {
+        // Mark channel in case of fault during fetching precondition
+        sessionContext.channels[preset.channel] = 0;
+        parameters.add(e.path.toString());
       }
-    }
+      return e;
+    };
+
+    pre.precondition = preset.precondition.evaluate(evalCallback);
+
+    pre.provisions = pre.provisions.map((prov) => {
+      let args = prov.slice(1) as Expression[];
+      args = args.map((arg) => arg.evaluate(evalCallback));
+      return [prov[0], ...args];
+    });
+
+    filteredPresets.push(pre);
   }
 
-  const declarations = Object.values(parameters).map((v) => ({
-    path: v,
-    pathGet: 1,
-    pathSet: null,
-    attrGet: { value: 1 },
-    attrSet: null,
-    defer: true,
-  }));
+  const declarations: Declaration[] = [...parameters].map(
+    (v): Declaration => ({
+      path: Path.parse(v),
+      pathGet: 1,
+      pathSet: undefined,
+      attrGet: { value: 1 },
+      attrSet: undefined,
+      defer: true,
+    }),
+  );
 
   const {
     fault: flt,
@@ -517,25 +523,24 @@ async function applyPresets(sessionContext: SessionContext): Promise<void> {
   session.clearProvisions(sessionContext);
 
   if (whiteList != null)
-    session.addProvisions(sessionContext, whiteList, whiteListProvisions);
+    session.addProvisions(sessionContext, whiteList[0], whiteList[1]);
 
-  const appendProvisionsToFaults = {};
+  const appendProvisionsToFaults: Record<string, [string, ...Value[]][]> = {};
+
+  const evalCallback2 = (e: Expression): Expression.Literal => {
+    e = session.configContextCallback(sessionContext, e);
+    if (!(e instanceof Expression.Literal)) return new Expression.Literal(null);
+    return e;
+  };
+
   for (const p of filteredPresets) {
-    if (
-      evaluate(p.precondition, {}, sessionContext.timestamp, (e) =>
-        session.configContextCallback(sessionContext, e),
-      )
-    ) {
+    if (p.precondition.evaluate(evalCallback2).value) {
       const provs = p.provisions.map((pp) => [
         pp[0],
         ...pp
           .slice(1)
-          .map((arg) =>
-            evaluate(arg, {}, sessionContext.timestamp, (e) =>
-              session.configContextCallback(sessionContext, e),
-            ),
-          ),
-      ]) as [string, ...Expression[]][];
+          .map((arg) => (arg as Expression).evaluate(evalCallback2).value),
+      ]) as [string, ...Value[]][];
       if (blackList[p.channel] === 2) {
         appendProvisionsToFaults[p.channel] = (
           appendProvisionsToFaults[p.channel] || []
@@ -649,7 +654,8 @@ async function nextRpc(sessionContext: SessionContext): Promise<void> {
 
   // Clear expired tasks
   sessionContext.tasks = sessionContext.tasks.filter((task) => {
-    if (!(task.expiry <= sessionContext.timestamp)) return true;
+    if (task.expiry == null || !(task.expiry <= sessionContext.timestamp))
+      return true;
 
     logger.accessInfo({
       sessionContext: sessionContext,
@@ -657,13 +663,11 @@ async function nextRpc(sessionContext: SessionContext): Promise<void> {
       task: task,
     });
 
-    if (!sessionContext.doneTasks) sessionContext.doneTasks = [];
-    sessionContext.doneTasks.push(task._id);
+    sessionContext.doneTasks.push(task._id!);
 
     const channel = `task_${task._id}`;
     if (sessionContext.faults[channel]) {
       delete sessionContext.faults[channel];
-      if (!sessionContext.faultsTouched) sessionContext.faultsTouched = {};
       sessionContext.faultsTouched[channel] = true;
     }
 
@@ -676,74 +680,79 @@ async function nextRpc(sessionContext: SessionContext): Promise<void> {
 
   if (!task) return applyPresets(sessionContext);
 
+  const taskId = task._id!;
+  const taskChannel = `task_${taskId}`;
   let alias;
 
   switch (task.name) {
     case "getParameterValues":
       // Set channel in case params array is empty
-      sessionContext.channels[`task_${task._id}`] = 0;
-      for (const p of task.parameterNames) {
-        session.addProvisions(sessionContext, `task_${task._id}`, [
-          ["refresh", p],
-        ]);
+      sessionContext.channels[taskChannel] = 0;
+      for (const p of task.parameterNames ?? []) {
+        session.addProvisions(sessionContext, taskChannel, [["refresh", p]]);
       }
 
       break;
     case "setParameterValues":
       // Set channel in case params array is empty
-      sessionContext.channels[`task_${task._id}`] = 0;
-      for (const p of task.parameterValues) {
-        session.addProvisions(sessionContext, `task_${task._id}`, [
-          ["value", p[0], p[1]],
+      sessionContext.channels[taskChannel] = 0;
+      for (const p of task.parameterValues ?? []) {
+        session.addProvisions(sessionContext, taskChannel, [
+          ["value", p[0], p[1] ?? ""],
         ]);
       }
 
       break;
     case "refreshObject":
-      session.addProvisions(sessionContext, `task_${task._id}`, [
-        ["refresh", task.objectName],
+      session.addProvisions(sessionContext, taskChannel, [
+        ["refresh", task.objectName ?? ""],
       ]);
       break;
     case "reboot":
-      session.addProvisions(sessionContext, `task_${task._id}`, [["reboot"]]);
+      session.addProvisions(sessionContext, taskChannel, [["reboot"]]);
       break;
     case "factoryReset":
-      session.addProvisions(sessionContext, `task_${task._id}`, [["reset"]]);
+      session.addProvisions(sessionContext, taskChannel, [["reset"]]);
       break;
     case "download":
-      session.addProvisions(sessionContext, `task_${task._id}`, [
-        ["download", task.fileType, task.fileName, task.targetFileName || ""],
+      session.addProvisions(sessionContext, taskChannel, [
+        [
+          "download",
+          task.fileType ?? "",
+          task.fileName ?? "",
+          task.targetFileName ?? "",
+        ],
+      ]);
+      break;
+    case "upload":
+      session.addProvisions(sessionContext, taskChannel, [
+        ["upload", task.fileType ?? "", task.fileName ?? ""],
       ]);
       break;
     case "addObject":
       alias = (task.parameterValues || [])
         .map((p) => `${p[0]}:${JSON.stringify(p[1])}`)
         .join(",");
-      session.addProvisions(sessionContext, `task_${task._id}`, [
+      session.addProvisions(sessionContext, taskChannel, [
         ["instances", `${task.objectName}.[${alias}]`, "+1"],
       ]);
       break;
     case "deleteObject":
-      session.addProvisions(sessionContext, `task_${task._id}`, [
-        ["instances", task.objectName, 0],
+      session.addProvisions(sessionContext, taskChannel, [
+        ["instances", task.objectName ?? "", 0],
       ]);
       break;
     case "provisions":
-      session.addProvisions(
-        sessionContext,
-        `task_${task._id}`,
-        task.provisions,
-      );
+      session.addProvisions(sessionContext, taskChannel, task.provisions ?? []);
       break;
     default:
-      if (!sessionContext.doneTasks) sessionContext.doneTasks = [];
-      sessionContext.doneTasks.push(task._id);
+      sessionContext.doneTasks.push(taskId);
       sessionContext.tasks = sessionContext.tasks.filter((t) => t !== task);
 
       logger.accessWarn({
         sessionContext: sessionContext,
         message: "Invalid task",
-        taskId: task._id,
+        taskId: taskId,
       });
   }
 
@@ -823,8 +832,8 @@ async function endSession(sessionContext: SessionContext): Promise<void> {
 
 async function sendAcsRequest(
   sessionContext: SessionContext,
-  id?: string,
-  acsRequest?: AcsRequest,
+  id?: string | null,
+  acsRequest?: AcsRequest | null,
 ): Promise<void> {
   if (!acsRequest)
     return writeResponse(sessionContext, soap.response(null), true);
@@ -835,7 +844,7 @@ async function sendAcsRequest(
       let prefix = "" + config.get("FS_URL_PREFIX");
 
       if (!prefix) {
-        const FS_PORT = +config.get("FS_PORT");
+        const FS_PORT = Number(config.get("FS_PORT"));
         const ssl = !!config.get("FS_SSL_CERT");
         const origin = getRequestOrigin(sessionContext.httpRequest);
         let hostname = origin.localAddress;
@@ -843,16 +852,34 @@ async function sendAcsRequest(
         prefix = (ssl ? "https" : "http") + `://${hostname}:${FS_PORT}/`;
       }
 
-      acsRequest.url = prefix + encodeURI(acsRequest.fileName);
+      const fileName = acsRequest.fileName ?? "";
+      acsRequest.url =
+        prefix + fileName.split("/").map(encodeURIComponent).join("/");
 
       const files = localCache.getFiles(sessionContext.cacheSnapshot);
-      if (files[acsRequest.fileName])
-        acsRequest.fileSize = files[acsRequest.fileName].length;
+      if (files[fileName]) acsRequest.fileSize = files[fileName].length;
     }
   }
 
+  if (acsRequest.name === "Upload") {
+    let prefix = "" + config.get("FS_URL_PREFIX");
+
+    if (!prefix) {
+      const FS_PORT = Number(config.get("FS_PORT"));
+      const ssl = !!config.get("FS_SSL_CERT");
+      const origin = getRequestOrigin(sessionContext.httpRequest);
+      let hostname = origin.localAddress;
+      if (origin.host) [hostname] = origin.host.split(":", 1);
+      prefix = (ssl ? "https" : "http") + `://${hostname}:${FS_PORT}/`;
+    }
+
+    acsRequest.url =
+      prefix +
+      (acsRequest.fileName ?? "").split("/").map(encodeURIComponent).join("/");
+  }
+
   const rpc = {
-    id: id,
+    id: id!,
     acsRequest: acsRequest,
     cwmpVersion: sessionContext.cwmpVersion,
   };
@@ -925,16 +952,18 @@ export async function onConnection(socket: Socket): Promise<void> {
 export async function onClientError(err: Error, socket: Socket): Promise<void> {
   const remoteAddress = getSocketEndpoints(socket).remoteAddress;
   const cacheSnapshot = await localCache.getRevision();
-  const debugEnabled = !!localCache.getConfig(
+  const debugEnabled = localCache.getConfig(
     cacheSnapshot,
     "cwmp.debug",
-    {
-      remoteAddress: remoteAddress,
-    },
-    Date.now(),
+    false,
     (e) => {
-      if (Array.isArray(e) && e[0] === "FUNC" && e[1] === "REMOTE_ADDRESS")
-        return remoteAddress;
+      if (e instanceof Expression.FunctionCall) {
+        if (e.name === "REMOTE_ADDRESS")
+          return new Expression.Literal(remoteAddress);
+        if (e.name === "NOW") return new Expression.Literal(Date.now());
+      }
+      if (!(e instanceof Expression.Literal))
+        return new Expression.Literal(null);
       return e;
     },
   );
@@ -977,7 +1006,7 @@ async function responseUnauthorized(
   sessionContext: SessionContext,
   close: boolean,
 ): Promise<void> {
-  const resHeaders = {};
+  const resHeaders: Record<string, string> = {};
   if (close) {
     // Invalid credentials
     logger.accessError({
@@ -1030,8 +1059,7 @@ async function processRequest(
     sessionContext.debug = !!localCache.getConfig(
       sessionContext.cacheSnapshot,
       "cwmp.debug",
-      {},
-      sessionContext.timestamp,
+      false,
       (e) => session.configContextCallback(sessionContext, e),
     );
 
@@ -1039,8 +1067,7 @@ async function processRequest(
       sessionContext.timeout = +localCache.getConfig(
         sessionContext.cacheSnapshot,
         "cwmp.sessionTimeout",
-        {},
-        sessionContext.timestamp,
+        30,
         (e) => session.configContextCallback(sessionContext, e),
       );
     }
@@ -1270,28 +1297,31 @@ export async function listener(
 async function clientError(
   httpRequest: IncomingMessage,
   httpResponse: ServerResponse,
-  sessionContext: SessionContext,
+  sessionContext: SessionContext | undefined,
   body: string,
   msg: string,
 ): Promise<void> {
-  let debugEnabled = false;
-  let deviceId: string = null;
+  let debugEnabled: boolean;
+  let deviceId: string | null = null;
 
   if (sessionContext) {
     debugEnabled = sessionContext.debug;
     deviceId = sessionContext.deviceId;
   } else {
     const cacheSnapshot = await localCache.getRevision();
-    debugEnabled = !!localCache.getConfig(
+    const remoteAddress = getRequestOrigin(httpRequest).remoteAddress;
+    debugEnabled = localCache.getConfig(
       cacheSnapshot,
       "cwmp.debug",
-      {
-        remoteAddress: getRequestOrigin(httpRequest).remoteAddress,
-      },
-      Date.now(),
+      false,
       (e) => {
-        if (Array.isArray(e) && e[0] === "FUNC" && e[1] === "REMOTE_ADDRESS")
-          return getRequestOrigin(httpRequest).remoteAddress;
+        if (e instanceof Expression.FunctionCall) {
+          if (e.name === "REMOTE_ADDRESS")
+            return new Expression.Literal(remoteAddress);
+          if (e.name === "NOW") return new Expression.Literal(Date.now());
+        }
+        if (!(e instanceof Expression.Literal))
+          return new Expression.Literal(null);
         return e;
       },
     );
@@ -1309,10 +1339,10 @@ async function clientError(
   if (sessionContext?.state) await endSession(sessionContext);
 }
 
-function decodeString(buffer: Buffer, charset: string): string {
+function decodeString(buffer: Buffer, charset: string): string | null {
   try {
     return buffer.toString(charset as BufferEncoding);
-  } catch (err) {
+  } catch {
     if (encodingExists(charset)) return decode(buffer, charset);
   }
   return null;
@@ -1333,12 +1363,12 @@ async function listenerAsync(
     return;
   }
 
-  let sessionId;
+  let sessionId: string | undefined;
   // Separation by comma is important as some devices don't comform to standard
   const COOKIE_REGEX =
     /\s*([a-zA-Z0-9\-_]+?)\s*=\s*"?([a-zA-Z0-9\-_]*?)"?\s*(,|;|$)/g;
-  let match;
-  while ((match = COOKIE_REGEX.exec(httpRequest.headers.cookie)))
+  let match: RegExpExecArray | null;
+  while ((match = COOKIE_REGEX.exec(httpRequest.headers.cookie ?? "")))
     if (match[1] === "session") sessionId = match[2];
 
   // If overloaded, ask CPE to retry in 60 seconds
@@ -1383,7 +1413,7 @@ async function listenerAsync(
     // connection is closed before the stream is finished.
     // For Node 12.9+ we can just use stream.readableEnded
     if (!readableEnded) throw new Error("Connection closed");
-  } catch (err) {
+  } catch {
     return;
   }
 
@@ -1414,7 +1444,7 @@ async function listenerAsync(
     }
   }
 
-  let charset: string;
+  let charset: string | undefined;
   if (httpRequest.headers["content-type"]) {
     const m = httpRequest.headers["content-type"].match(
       /charset=['"]?([^'"\s]+)/i,
@@ -1459,11 +1489,12 @@ async function listenerAsync(
     );
   }
 
-  const parseWarnings = [];
+  const parseWarnings: Record<string, unknown>[] = [];
   let rpc: SoapMessage;
   try {
     rpc = soap.request(bodyStr, parseWarnings);
   } catch (err) {
+    if (!(err instanceof Error)) throw err;
     if (!sessionContext && sessionId) {
       await new Promise((resolve) => setTimeout(resolve, 100));
       const sessionContextString = await cache.pop(`session_${sessionId}`);
@@ -1507,7 +1538,7 @@ async function listenerAsync(
   if (sessionContext)
     return processRequest(sessionContext, rpc, parseWarnings, bodyStr);
 
-  if (rpc.cpeRequest?.name !== "Inform") {
+  if (!rpc.cpeRequest || rpc.cpeRequest.name !== "Inform") {
     logger.accessError({
       message: "Invalid session",
       sessionContext: {
@@ -1519,7 +1550,7 @@ async function listenerAsync(
     return clientError(
       httpRequest,
       httpResponse,
-      null,
+      undefined,
       bodyStr,
       "Invalid session",
     );
@@ -1540,16 +1571,14 @@ async function listenerAsync(
   const cacheSnapshot = await localCache.getRevision();
 
   const _sessionContext = session.init(
+    crypto.randomBytes(8).toString("hex"),
     deviceId,
     rpc.cwmpVersion,
-    rpc.sessionTimeout,
+    rpc.sessionTimeout ?? 0,
+    httpRequest,
+    httpResponse,
+    cacheSnapshot,
   );
-
-  _sessionContext.cacheSnapshot = cacheSnapshot;
-
-  _sessionContext.httpRequest = httpRequest;
-  _sessionContext.httpResponse = httpResponse;
-  _sessionContext.sessionId = crypto.randomBytes(8).toString("hex");
 
   const [dueTasks, faults, operations] = await Promise.all([
     getDueTasks(deviceId, _sessionContext.timestamp),
@@ -1560,15 +1589,13 @@ async function listenerAsync(
   _sessionContext.tasks = dueTasks[0];
   _sessionContext.operations = operations;
   _sessionContext.faults = faults;
-  _sessionContext.retries = {};
   for (const [k, v] of Object.entries(_sessionContext.faults)) {
-    if (v.expiry >= _sessionContext.timestamp) {
+    if (v.expiry != null && v.expiry >= _sessionContext.timestamp) {
       // Delete expired faults
       delete _sessionContext.faults[k];
-      if (!_sessionContext.faultsTouched) _sessionContext.faultsTouched = {};
       _sessionContext.faultsTouched[k] = true;
     } else {
-      _sessionContext.retries[k] = v.retries;
+      _sessionContext.retries[k] = v.retries ?? 0;
     }
   }
 

@@ -1,11 +1,10 @@
-import { ClosureComponent, Component } from "mithril";
-import { m } from "./components.ts";
+import { p, div } from "./dom.ts";
 
-export const component: ClosureComponent = (): Component => {
-  return {
-    view: function (vnode) {
-      document.title = "Error! - GenieACS";
-      return m("p.error", vnode.attrs["error"]);
-    },
-  };
-};
+interface Attrs {
+  error: string;
+}
+
+export function createPage(attrs: Attrs): HTMLElement {
+  document.title = "Error! - GenieACS";
+  return div({}, p({ class: "text-sm font-bold text-red-500" }, attrs.error));
+}

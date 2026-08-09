@@ -1,55 +1,74 @@
-import { Editor } from "codemirror";
-import { ClosureComponent } from "mithril";
-import { m } from "./components.ts";
+import { div } from "./dom.ts";
 import { codeMirror } from "./dynamic-loader.ts";
 
 interface Attrs {
-  id: string;
   value: string;
   mode: string;
   readOnly?: boolean;
   focus?: boolean;
-  onSubmit?: (dom: Element) => void;
   onChange?: (value: string) => void;
-  onReady?: (editor: Editor) => void;
 }
 
-const component: ClosureComponent<Attrs> = () => {
-  return {
-    view: (vnode) => {
-      return m("textarea", {
-        name: vnode.attrs.id,
-        value: vnode.attrs.value,
-        oncreate: (_vnode) => {
-          const editor = codeMirror.fromTextArea(
-            _vnode.dom as HTMLTextAreaElement,
-            {
-              mode: vnode.attrs.mode,
-              lineNumbers: true,
-              readOnly: vnode.attrs.readOnly,
-              extraKeys: {
-                "Ctrl-Enter": () => {
-                  if (vnode.attrs.onSubmit) vnode.attrs.onSubmit(_vnode.dom);
-                },
-                "Cmd-Enter": () => {
-                  if (vnode.attrs.onSubmit) vnode.attrs.onSubmit(_vnode.dom);
-                },
-              },
-            },
-          );
+function mount(container: HTMLElement, attrs: Attrs): void {
+  if (!container.isConnected) return;
 
-          if (vnode.attrs.onChange) {
-            editor.on("change", (e) => {
-              vnode.attrs.onChange(e.getValue());
-            });
-          }
-
-          if (vnode.attrs.focus) editor.focus();
-          if (vnode.attrs.onReady) vnode.attrs.onReady(editor);
+  const extensions = [
+    codeMirror.EditorView.theme({
+      "&.cm-editor": {
+        display: "block",
+        "background-color": "var(--color-white)",
+        width: "50rem",
+        height: "30rem",
+        "max-width": "100%",
+        "border-radius": "0.375rem",
+        "border-width": "1px",
+        "border-color": "var(--color-stone-300)",
+        "box-shadow":
+          "var(--tw-ring-shadow, 0 0 #0000), 0 1px 2px 0 rgb(0 0 0 / 0.05)",
+        overflow: "hidden",
+        "& > .cm-scroller": {
+          "font-family": "inherit",
+          "line-height": "inherit",
         },
-      });
-    },
-  };
-};
+      },
+      "&.cm-editor.cm-focused": {
+        outline: "none",
+        "border-color": "var(--color-cyan-500)",
+        "--tw-ring-shadow": "0 0 0 1px var(--color-cyan-500)",
+      },
+    }),
+    codeMirror.lineNumbers(),
+    codeMirror.history(),
+    codeMirror.syntaxHighlighting(codeMirror.defaultHighlightStyle),
+    codeMirror.keymap.of([
+      ...codeMirror.defaultKeymap,
+      ...codeMirror.historyKeymap,
+    ]),
+    codeMirror.EditorState.readOnly.of(!!attrs.readOnly),
+    codeMirror.EditorView.updateListener.of((update) => {
+      if (update.docChanged && attrs.onChange)
+        attrs.onChange(update.state.doc.toString());
+    }),
+  ];
 
-export default component;
+  if (attrs.mode === "javascript") extensions.push(codeMirror.javascript());
+  else if (attrs.mode === "jsx")
+    extensions.push(codeMirror.javascript({ jsx: true }));
+  else if (attrs.mode === "yaml") extensions.push(codeMirror.yaml());
+
+  const editor = new codeMirror.EditorView({
+    state: codeMirror.EditorState.create({
+      doc: attrs.value,
+      extensions,
+    }),
+    parent: container,
+  });
+
+  if (attrs.focus) editor.focus();
+}
+
+export function codeEditor(attrs: Attrs): HTMLDivElement {
+  const container = div({ class: "font-mono text-sm" });
+  requestAnimationFrame(() => mount(container, attrs));
+  return container;
+}

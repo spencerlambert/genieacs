@@ -1,9 +1,9 @@
-import { Attributes, ClosureComponent } from "mithril";
-import { map } from "../../lib/common/expression/parser.ts";
+import { Attributes, ClosureComponent } from "../mithril-compat.ts";
 import memoize from "../../lib/common/memoize.ts";
-import { Expression } from "../../lib/types.ts";
+import Expression, { Value } from "../../lib/common/expression.ts";
 import { m } from "../components.ts";
-import { evaluateExpression, getTimestamp } from "../store.ts";
+import { evaluateExpression } from "../reactive-store.ts";
+import { getTimestamp } from "../legacy-store.ts";
 import { FlatDevice } from "../../lib/ui/db.ts";
 
 const evaluateAttributes = memoize(
@@ -14,15 +14,16 @@ const evaluateAttributes = memoize(
   ): Attributes => {
     const res: Attributes = {};
     for (const [k, v] of Object.entries(attrs)) {
-      const vv = map(v, (e) => {
-        if (
-          Array.isArray(e) &&
-          e[0] === "FUNC" &&
-          e[1] === "ENCODEURICOMPONENT"
-        ) {
-          const a = evaluateExpression(e[2], obj);
-          if (a == null) return null;
-          return encodeURIComponent(a as string);
+      const vv = v.evaluate((e) => {
+        if (e instanceof Expression.Literal) return e;
+        else if (e instanceof Expression.FunctionCall) {
+          if (e.name === "ENCODEURICOMPONENT") {
+            const a = evaluateExpression(e.args[0], obj);
+            if (a instanceof Expression.Literal) {
+              if (a.value == null) return new Expression.Literal(null);
+              return new Expression.Literal(encodeURIComponent(a.value));
+            }
+          }
         }
         return e;
       });
@@ -35,7 +36,10 @@ const evaluateAttributes = memoize(
 interface Attrs {
   device: FlatDevice;
   filter: Expression;
-  components: unknown;
+  components: Record<string, unknown>;
+  element?:
+    | Expression
+    | { tag: Expression; attributes?: Record<string, Expression> };
 }
 
 const component: ClosureComponent<Attrs> = () => {
@@ -43,37 +47,39 @@ const component: ClosureComponent<Attrs> = () => {
     view: (vnode) => {
       const device = vnode.attrs.device;
       if ("filter" in vnode.attrs) {
-        if (!evaluateExpression(vnode.attrs.filter, device || {})) return null;
+        if (!evaluateExpression(vnode.attrs.filter, device || {}).value)
+          return null;
       }
 
       const children = Object.values(vnode.attrs.components).map((c) => {
-        if (Array.isArray(c)) c = evaluateExpression(c, device || {});
-        if (typeof c !== "object") return `${c}`;
-        const type = evaluateExpression(c["type"], device || {});
+        if (c instanceof Expression)
+          c = evaluateExpression(c, device || {}).value;
+        if (typeof c !== "object" || c == null) return `${c}`;
+        const comp = c as { type: Expression };
+        const type = evaluateExpression(comp.type, device || {}).value;
         if (!type) return null;
-        return m(type as string, c);
+        return m(type as string, comp);
       });
 
-      let el = vnode.attrs["element"];
+      const element = vnode.attrs.element;
+      if (element == null) return children;
 
-      if (el == null) return children;
-
-      let attrs: Attributes;
-      if (Array.isArray(el)) {
-        el = evaluateExpression(el, device || {});
-      } else if (typeof el === "object") {
-        if (el["attributes"] != null) {
+      let attrs: Attributes | undefined;
+      let el: Expression | Value;
+      if (element instanceof Expression) {
+        el = evaluateExpression(element, device || {}).value;
+      } else {
+        if (element.attributes != null) {
           attrs = evaluateAttributes(
-            el["attributes"],
+            element.attributes,
             device || {},
             getTimestamp(),
           );
         }
-
-        el = evaluateExpression(el["tag"], device || {});
+        el = evaluateExpression(element.tag, device || {}).value;
       }
 
-      return m(el, attrs, children);
+      return m(el as string, attrs ?? {}, children);
     },
   };
 };
