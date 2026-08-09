@@ -715,6 +715,11 @@ async function nextRpc(sessionContext: SessionContext): Promise<void> {
         ["download", task.fileType, task.fileName, task.targetFileName || ""],
       ]);
       break;
+    case "upload":
+      session.addProvisions(sessionContext, `task_${task._id}`, [
+        ["upload", "1 Vendor Configuration File", task.fileName || ""],
+      ]);
+      break;
     case "addObject":
       alias = (task.parameterValues || [])
         .map((p) => `${p[0]}:${JSON.stringify(p[1])}`)
@@ -848,6 +853,33 @@ async function sendAcsRequest(
       const files = localCache.getFiles(sessionContext.cacheSnapshot);
       if (files[acsRequest.fileName])
         acsRequest.fileSize = files[acsRequest.fileName].length;
+    }
+  }
+
+  if (acsRequest.name === "Upload") {
+    if (!acsRequest.url) {
+      const prefix = String(config.get("FS_UP_URL_PREFIX") || "");
+      if (!prefix) throw new Error("FS_UP_URL_PREFIX must be configured");
+
+      let parsedPrefix: URL;
+      try {
+        parsedPrefix = new URL(prefix);
+      } catch {
+        throw new Error("Invalid FS_UP_URL_PREFIX configuration");
+      }
+
+      if (!["http:", "https:"].includes(parsedPrefix.protocol))
+        throw new Error("FS_UP_URL_PREFIX must use HTTP or HTTPS");
+
+      if (parsedPrefix.search || parsedPrefix.hash)
+        throw new Error(
+          "FS_UP_URL_PREFIX must not contain a query string or fragment",
+        );
+
+      if (!prefix.endsWith("/"))
+        throw new Error("FS_UP_URL_PREFIX must end with '/'");
+
+      acsRequest.url = prefix + encodeURIComponent(acsRequest.fileName);
     }
   }
 

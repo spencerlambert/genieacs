@@ -26,6 +26,7 @@ import {
   type RebootResponse,
   type FactoryResetResponse,
   type DownloadResponse,
+  type UploadResponse,
   GetRPCMethodsRequest,
   RequestDownloadRequest,
   AcsResponse,
@@ -554,6 +555,70 @@ function DownloadResponse(xml: Element): DownloadResponse {
   };
 }
 
+function Upload(methodRequest): string {
+  return `<cwmp:Upload><CommandKey>${encodeEntities(
+    methodRequest.commandKey || "",
+  )}</CommandKey><FileType>${encodeEntities(
+    methodRequest.fileType,
+  )}</FileType><URL>${encodeEntities(
+    methodRequest.url,
+  )}</URL><Username>${encodeEntities(
+    methodRequest.username || "",
+  )}</Username><Password>${encodeEntities(
+    methodRequest.password || "",
+  )}</Password><DelaySeconds>${
+    methodRequest.delaySeconds || "0"
+  }</DelaySeconds></cwmp:Upload>`;
+}
+
+function UploadResponse(xml: Element): UploadResponse {
+  let status: number, startTime: number, completeTime: number;
+  for (const c of xml.children) {
+    switch (c.localName) {
+      case "Status":
+        status = parseInt(c.text);
+        break;
+      case "StartTime":
+        startTime = Date.parse(c.text);
+        break;
+      case "CompleteTime":
+        completeTime = Date.parse(c.text);
+        break;
+    }
+  }
+
+  if (!(status >= 0)) {
+    warnings.push({
+      message: "Missing or invalid XML node",
+      element: "Status",
+    });
+    status = 0;
+  }
+
+  if (startTime == null || isNaN(startTime)) {
+    warnings.push({
+      message: "Missing or invalid XML node",
+      element: "StartTime",
+    });
+    startTime = Date.parse("0001-01-01T00:00:00Z");
+  }
+
+  if (completeTime == null || isNaN(completeTime)) {
+    warnings.push({
+      message: "Missing or invalid XML node",
+      element: "CompleteTime",
+    });
+    completeTime = Date.parse("0001-01-01T00:00:00Z");
+  }
+
+  return {
+    name: "UploadResponse",
+    status: status,
+    startTime: startTime,
+    completeTime: completeTime,
+  };
+}
+
 function Inform(xml: Element): InformRequest {
   let retryCount: number, evnt: string[];
   let parameterList: [Path, string | number | boolean, string][];
@@ -949,6 +1014,9 @@ export function request(
     case "DownloadResponse":
       rpc.cpeResponse = DownloadResponse(methodElement);
       break;
+    case "UploadResponse":
+      rpc.cpeResponse = UploadResponse(methodElement);
+      break;
     case "Fault":
       rpc.cpeFault = fault(methodElement);
       break;
@@ -1045,6 +1113,9 @@ export function response(rpc: {
         break;
       case "Download":
         body = Download(rpc.acsRequest);
+        break;
+      case "Upload":
+        body = Upload(rpc.acsRequest);
         break;
       default:
         throw new Error(

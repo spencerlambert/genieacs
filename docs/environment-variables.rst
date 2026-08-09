@@ -172,6 +172,14 @@ FS_URL_PREFIX
   Default: auto generated based on the hostname from the ACS URL, FS_PORT
   config, and whether or not SSL is enabled for genieacs-fs.
 
+FS_UP_URL_PREFIX
+  The URL prefix (e.g. 'https://uploads.example.com:8443/') to use when
+  generating the destination URL for TR-069 Upload requests. It must use HTTP
+  or HTTPS, end with a slash, and contain no query string or fragment. This
+  must be configured before issuing an Upload request.
+
+  Default: unset
+
 UI_WORKER_PROCESSES
   The number of worker processes to spawn for genieacs-ui. A value of 0 means
   as many as there are CPU cores available.

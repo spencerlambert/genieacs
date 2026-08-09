@@ -57,6 +57,12 @@ function getTypes(parameter: string, collection: string): string[] {
       if (parameter.endsWith("Name._value")) return ["string"];
       if (parameter.endsWith("Type._value")) return ["string"];
     }
+    if (parameter.startsWith("Uploads.")) {
+      if (parameter.endsWith("Upload._value")) return ["date"];
+      if (parameter.endsWith("Time._value")) return ["date"];
+      if (parameter.endsWith("Name._value")) return ["string"];
+      if (parameter.endsWith("Type._value")) return ["string"];
+    }
     if (parameter.endsWith("_value"))
       return ["bool", "number", "date", "string"];
   } else if (collection === "tasks") {

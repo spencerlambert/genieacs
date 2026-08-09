@@ -46,6 +46,7 @@ const options = {
   FS_URL_PREFIX: { type: "string", default: "" },
   FS_LOG_FILE: { type: "path", default: "" },
   FS_ACCESS_LOG_FILE: { type: "path", default: "" },
+  FS_UP_URL_PREFIX: { type: "string", default: "" },
 
   UI_WORKER_PROCESSES: { type: "int", default: 0 },
   UI_PORT: { type: "int", default: 3000 },
@@ -60,6 +61,7 @@ const options = {
   FORWARDED_HEADER: { type: "string", default: "" },
 
   DOWNLOAD_TIMEOUT: { type: "int", default: 3600 },
+  UPLOAD_TIMEOUT: { type: "int", default: 3600 },
   EXT_TIMEOUT: { type: "int", default: 3000 },
   MAX_CACHE_TTL: { type: "int", default: 86400 },
   DEBUG_FILE: { type: "path", default: "" },

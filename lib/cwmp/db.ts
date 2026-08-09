@@ -631,6 +631,9 @@ export async function getDueTasks(
         fileName: t.fileName,
         targetFileName: t.targetFileName,
       }),
+      ...(t.name === "upload" && {
+        fileName: t.fileName,
+      }),
       ...(t.name === "addObject" && {
         objectName: t.objectName,
         parameterValues: t.parameterValues,
@@ -690,7 +693,7 @@ export async function getOperations(
       operations[commandKey] = r as unknown as Operation;
       continue;
     }
-    const operation: Operation = {
+    const operation = {
       name: r.name,
       timestamp: +r.timestamp,
       channels:
@@ -698,7 +701,7 @@ export async function getOperations(
       retries: JSON.parse(r.retries),
       provisions: JSON.parse(r.provisions),
       ...(r.args && { args: JSON.parse(r.args) }),
-    };
+    } as Operation;
     operations[commandKey] = operation;
   }
   return operations;

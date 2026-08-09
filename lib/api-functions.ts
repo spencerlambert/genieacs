@@ -327,6 +327,11 @@ function sanitizeTask(task): void {
         throw new Error("Invalid 'targetFileName' property");
       break;
 
+    case "upload":
+      if (typeof task.fileName !== "string" || !task.fileName.trim().length)
+        throw new Error("Missing 'fileName' property");
+      break;
+
     case "provisions":
       if (
         !Array.isArray(task.provisions) ||
