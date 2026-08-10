@@ -2,7 +2,7 @@ import * as vm from "node:vm";
 import { IncomingMessage, ServerResponse } from "node:http";
 import { ObjectId } from "mongodb";
 import { getRevision, getConfig } from "./ui/local-cache.ts";
-import { filesBucket, collections } from "./db/db.ts";
+import { filesBucket, uploadsBucket, collections } from "./db/db.ts";
 import { optimizeProjection } from "./db/util.ts";
 import * as query from "./query.ts";
 import * as apiFunctions from "./api-functions.ts";
@@ -23,6 +23,7 @@ const TAGS_REGEX =
 const PRESETS_REGEX = /^\/presets\/([a-zA-Z0-9\-_%]+)\/?$/;
 const OBJECTS_REGEX = /^\/objects\/([a-zA-Z0-9\-_%]+)\/?$/;
 const FILES_REGEX = /^\/files\/([a-zA-Z0-9%!*'();:@&=+$,?#[\]\-_.~]+)\/?$/;
+const DEVICE_UPLOADS_REGEX = /^\/device-uploads\/([^/]+)\/(.+)$/;
 const PING_REGEX = /^\/ping\/([a-zA-Z0-9\-_.:]+)\/?$/;
 const QUERY_REGEX = /^\/([a-zA-Z0-9_]+)\/?$/;
 const DELETE_DEVICE_REGEX = /^\/devices\/([a-zA-Z0-9\-_%]+)\/?$/;
@@ -496,6 +497,47 @@ async function handler(
       response.writeHead(404);
       response.end();
     }
+  } else if ((match = DEVICE_UPLOADS_REGEX.exec(url.pathname))) {
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      response.writeHead(405, { Allow: "GET, HEAD" });
+      response.end("405 Method Not Allowed");
+      return;
+    }
+
+    const deviceId = decodeURIComponent(match[1]);
+    const requestedFileName = decodeURIComponent(match[2]);
+    const id = `${deviceId}/${requestedFileName}`;
+    const upload = await collections.uploads.findOne({ _id: id });
+    if (!upload) {
+      response.writeHead(404);
+      response.end("404 Not Found");
+      return;
+    }
+
+    const pathParts = requestedFileName.split("/");
+    const fileName = pathParts[pathParts.length - 1] || "device-upload";
+    const safeFileName = fileName.replace(/[^\x20-\x7e]|["\\]/g, "_");
+    response.writeHead(200, {
+      "Content-Type": "application/octet-stream",
+      "Content-Length": upload.length,
+      "Content-Disposition": `attachment; filename="${safeFileName}"`,
+      "Cache-Control": "no-cache",
+    });
+
+    if (request.method === "HEAD") {
+      response.end();
+      return;
+    }
+
+    return new Promise((resolve, reject) => {
+      const downloadStream = uploadsBucket.openDownloadStreamByName(id);
+      downloadStream.on("error", (err) => {
+        response.destroy();
+        reject(err);
+      });
+      response.on("finish", resolve);
+      downloadStream.pipe(response);
+    });
   } else if ((match = FILES_REGEX.exec(url.pathname))) {
     const filename = decodeURIComponent(match[1]);
     if (request.method === "PUT") {
