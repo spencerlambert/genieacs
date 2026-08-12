@@ -60,6 +60,7 @@ const options = {
   FORWARDED_HEADER: { type: "string", default: "" },
 
   DOWNLOAD_TIMEOUT: { type: "int", default: 3600 },
+  UPLOAD_TIMEOUT: { type: "int", default: 3600 },
   EXT_TIMEOUT: { type: "int", default: 3000 },
   MAX_CACHE_TTL: { type: "int", default: 86400 },
   DEBUG_FILE: { type: "path", default: "" },

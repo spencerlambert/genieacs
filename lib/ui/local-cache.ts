@@ -132,6 +132,7 @@ export function getConfig(
 
   const oldOpts = {
     "cwmp.downloadTimeout": "DOWNLOAD_TIMEOUT",
+    "cwmp.uploadTimeout": "UPLOAD_TIMEOUT",
     "cwmp.debug": "DEBUG",
     "cwmp.retryDelay": "RETRY_DELAY",
     "cwmp.sessionTimeout": "SESSION_TIMEOUT",
