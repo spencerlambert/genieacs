@@ -2115,7 +2115,10 @@ function generateSetRpcRequest(
       )
         val[0] -= val[0] % 1000;
 
-      if (val[0] !== curVal[0] || val[1] !== curVal[1])
+      // Writing DiagnosticsState again starts a test. The cached value is often
+      // still Requested after the CPE has finished, so the usual diff would drop it.
+      const bypassCache = k.segments[k.length - 1] === "DiagnosticsState";
+      if (bypassCache || val[0] !== curVal[0] || val[1] !== curVal[1])
         parameterValues.push([k.toString(), val[0], val[1]]);
 
       if (parameterValues.length >= GPV_BATCH_SIZE) break;
