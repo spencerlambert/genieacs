@@ -1888,7 +1888,8 @@ function generateGetRpcRequest(
     while (
       path &&
       path.length &&
-      !sessionContext.deviceData.attributes.has(path)
+      (parameterRejected(sessionContext, path.toString()) ||
+        !sessionContext.deviceData.attributes.has(path))
     ) {
       syncState.gpn.delete(path);
       path = paths.pop();
@@ -1945,6 +1946,7 @@ function generateGetRpcRequest(
     const parameterNames: string[] = [];
     for (const path of syncState.refreshAttributes.value) {
       syncState.refreshAttributes.value.delete(path);
+      if (parameterRejected(sessionContext, path.toString())) continue;
       // Need to check in case param is deleted or changed to object
       const attrs = sessionContext.deviceData.attributes.get(path);
       if (attrs?.object?.[1] === 0) {
@@ -3014,6 +3016,7 @@ export async function rpcResponse(
         });
         continue;
       }
+      if (parameterRejected(sessionContext, path.toString())) continue;
       if (object && !rpcReq.nextLevel)
         wildcardParams.push(path.concat(wildcardPath));
 
@@ -3307,6 +3310,35 @@ export async function rpcResponse(
   return null;
 }
 
+function rejectParameter(
+  sessionContext: SessionContext,
+  parameter: string,
+): void {
+  const path = parameter.replace(/\.$/, "");
+  if (!path) return;
+  if (!sessionContext.rejectedParameters) sessionContext.rejectedParameters = [];
+  const rejected = sessionContext.rejectedParameters;
+  for (let i = rejected.length - 1; i >= 0; --i) {
+    const existing = rejected[i];
+    if (path === existing || path.startsWith(`${existing}.`)) return;
+    if (existing.startsWith(`${path}.`)) rejected.splice(i, 1);
+  }
+  rejected.push(path);
+}
+
+function parameterRejected(
+  sessionContext: SessionContext,
+  parameter: string,
+): boolean {
+  const path = parameter.replace(/\.$/, "");
+  const rejected = sessionContext.rejectedParameters;
+  if (!path || !rejected) return false;
+  for (const existing of rejected) {
+    if (path === existing || path.startsWith(`${existing}.`)) return true;
+  }
+  return false;
+}
+
 export async function rpcFault(
   sessionContext: SessionContext,
   id: string,
@@ -3328,14 +3360,18 @@ export async function rpcFault(
     let toClear: Clear[];
     if (rpcReq.name === "GetParameterNames") {
       if (rpcReq.parameterPath) {
-        toClear = [
-          [Path.parse(rpcReq.parameterPath.replace(/\.$/, "")), timestamp],
-        ];
+        const parameterPath = rpcReq.parameterPath.replace(/\.$/, "");
+        toClear = [[Path.parse(parameterPath), timestamp]];
+        // Remember the path so the next parent listing cannot restore it.
+        rejectParameter(sessionContext, parameterPath);
       }
     } else if (rpcReq.name === "GetParameterValues") {
       toClear = rpcReq.parameterNames.map(
         (p) => [Path.parse(p.replace(/\.$/, "")), timestamp] as Clear,
       );
+      // A multi-name request does not say which name was invalid.
+      if (rpcReq.parameterNames.length === 1)
+        rejectParameter(sessionContext, rpcReq.parameterNames[0]);
     } else if (rpcReq.name === "SetParameterValues") {
       toClear = (
         rpcReq.parameterList as [string, string | number | boolean, string][]

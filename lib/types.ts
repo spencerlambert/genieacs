@@ -152,6 +152,9 @@ export interface SessionContext {
   operationsTouched?: { [commandKey: string]: 1 | 0 };
   provisionsRet?: any[];
   doneTasks?: string[];
+  // Parameter paths the CPE rejected with 9005 during this session.
+  // A later GetParameterNames must not store them again.
+  rejectedParameters?: string[];
 }
 
 export interface Task {
