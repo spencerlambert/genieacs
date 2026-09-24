@@ -2117,11 +2117,11 @@ function generateSetRpcRequest(
       )
         val[0] -= val[0] % 1000;
 
-      // The first write starts a test even when the cache still says Requested.
-      // Another write in this session would start it again.
+      // Send these once even when the cache already matches. Another write
+      // in this session would restart a test or set the password again.
       const bypassCache =
-        k.segments[k.length - 1] === "DiagnosticsState" &&
-        !diagnosticsStateWritten(sessionContext, k.toString());
+        bypassCacheOnce.has(k.segments[k.length - 1] as string) &&
+        !parameterWritten(sessionContext, k.toString());
       if (bypassCache || val[0] !== curVal[0] || val[1] !== curVal[1])
         parameterValues.push([k.toString(), val[0], val[1]]);
 
@@ -3061,8 +3061,8 @@ export async function rpcResponse(
         },
         toClear,
       );
-      if (p[0].endsWith(".DiagnosticsState") || p[0] === "DiagnosticsState")
-        rememberDiagnosticsState(sessionContext, p[0]);
+      if (bypassCacheOnce.has(p[0].split(".").pop()))
+        rememberParameterWritten(sessionContext, p[0]);
     }
   } else if (rpcRes.name === "SetParameterAttributesResponse") {
     if (rpcReq.name !== "SetParameterAttributes")
@@ -3314,22 +3314,27 @@ export async function rpcResponse(
   return null;
 }
 
-function diagnosticsStateWritten(
+const bypassCacheOnce = new Set([
+  "DiagnosticsState",
+  "ConnectionRequestUsername",
+  "ConnectionRequestPassword",
+]);
+
+function parameterWritten(
   sessionContext: SessionContext,
   parameter: string,
 ): boolean {
-  const written = sessionContext.diagnosticsStateWritten;
+  const written = sessionContext.parametersWritten;
   return !!written && written.includes(parameter);
 }
 
-function rememberDiagnosticsState(
+function rememberParameterWritten(
   sessionContext: SessionContext,
   parameter: string,
 ): void {
-  if (!sessionContext.diagnosticsStateWritten)
-    sessionContext.diagnosticsStateWritten = [];
-  if (!sessionContext.diagnosticsStateWritten.includes(parameter))
-    sessionContext.diagnosticsStateWritten.push(parameter);
+  if (!sessionContext.parametersWritten) sessionContext.parametersWritten = [];
+  if (!sessionContext.parametersWritten.includes(parameter))
+    sessionContext.parametersWritten.push(parameter);
 }
 
 function rejectParameter(

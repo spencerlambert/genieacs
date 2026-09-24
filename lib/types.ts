@@ -155,9 +155,9 @@ export interface SessionContext {
   // Parameter paths the CPE rejected with 9005 during this session.
   // A later GetParameterNames must not store them again.
   rejectedParameters?: string[];
-  // DiagnosticsState paths already written in this session. A later round
-  // must not bypass the cache and start the test again.
-  diagnosticsStateWritten?: string[];
+  // Paths already written once this session despite a matching cache.
+  // A later round must use the normal diff so the write is not repeated.
+  parametersWritten?: string[];
 }
 
 export interface Task {
