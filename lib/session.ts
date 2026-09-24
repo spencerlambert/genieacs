@@ -2117,9 +2117,11 @@ function generateSetRpcRequest(
       )
         val[0] -= val[0] % 1000;
 
-      // Writing DiagnosticsState again starts a test. The cached value is often
-      // still Requested after the CPE has finished, so the usual diff would drop it.
-      const bypassCache = k.segments[k.length - 1] === "DiagnosticsState";
+      // The first write starts a test even when the cache still says Requested.
+      // Another write in this session would start it again.
+      const bypassCache =
+        k.segments[k.length - 1] === "DiagnosticsState" &&
+        !diagnosticsStateWritten(sessionContext, k.toString());
       if (bypassCache || val[0] !== curVal[0] || val[1] !== curVal[1])
         parameterValues.push([k.toString(), val[0], val[1]]);
 
@@ -3059,6 +3061,8 @@ export async function rpcResponse(
         },
         toClear,
       );
+      if (p[0].endsWith(".DiagnosticsState") || p[0] === "DiagnosticsState")
+        rememberDiagnosticsState(sessionContext, p[0]);
     }
   } else if (rpcRes.name === "SetParameterAttributesResponse") {
     if (rpcReq.name !== "SetParameterAttributes")
@@ -3308,6 +3312,24 @@ export async function rpcResponse(
   }
 
   return null;
+}
+
+function diagnosticsStateWritten(
+  sessionContext: SessionContext,
+  parameter: string,
+): boolean {
+  const written = sessionContext.diagnosticsStateWritten;
+  return !!written && written.includes(parameter);
+}
+
+function rememberDiagnosticsState(
+  sessionContext: SessionContext,
+  parameter: string,
+): void {
+  if (!sessionContext.diagnosticsStateWritten)
+    sessionContext.diagnosticsStateWritten = [];
+  if (!sessionContext.diagnosticsStateWritten.includes(parameter))
+    sessionContext.diagnosticsStateWritten.push(parameter);
 }
 
 function rejectParameter(
